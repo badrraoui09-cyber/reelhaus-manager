@@ -9,6 +9,7 @@ import type { AuditReport, ReportSummary } from "./website-analysis";
 
 interface SalesSnapshot {
   mode: "draft_only" | "mock" | "gmail";
+  outreachEnabled: boolean;
   limits: { newLeadsPerDay: number; sendsPerDay: number };
   usage: { new_leads: number; sent_messages: number };
   leads: Lead[];
@@ -278,7 +279,14 @@ export default function App() {
             <section className="panel">
               <h2>E-Mail-Entwürfe</h2>
               {sales?.drafts.map((draft) => (
-                <DraftEditor key={draft.id} draft={draft} busy={busy} action={action} mode={sales.mode} />
+                <DraftEditor
+                  key={draft.id}
+                  draft={draft}
+                  busy={busy}
+                  action={action}
+                  mode={sales.mode}
+                  outreachEnabled={sales.outreachEnabled}
+                />
               ))}
             </section>
           </div>
@@ -292,11 +300,13 @@ function DraftEditor({
   draft,
   busy,
   action,
-  mode
+  mode,
+  outreachEnabled
 }: {
   draft: EmailDraft;
   busy: boolean;
   mode: SalesSnapshot["mode"];
+  outreachEnabled: boolean;
   action: (path: string, body?: unknown, method?: string) => Promise<void>;
 }) {
   const [subject, setSubject] = useState(draft.subject);
@@ -314,7 +324,9 @@ function DraftEditor({
         <button className="secondary" disabled={busy || draft.status === "sent"} onClick={() => action(`/api/drafts/${draft.id}`, { subject, body }, "PATCH")}>Edit speichern</button>
         <button disabled={busy || draft.status !== "draft_ready"} onClick={() => action(`/api/drafts/${draft.id}/approve`)}>Approve</button>
         <button className="danger" disabled={busy || draft.status === "sent"} onClick={() => action(`/api/drafts/${draft.id}/reject`)}>Reject</button>
-        {draft.status === "approved" && mode !== "draft_only" && (
+        {draft.status === "approved" &&
+          mode !== "draft_only" &&
+          outreachEnabled && (
           <button disabled={busy} onClick={() => action(`/api/drafts/${draft.id}/send`)}>Einmal senden</button>
         )}
       </div>

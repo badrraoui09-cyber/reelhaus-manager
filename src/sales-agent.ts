@@ -12,7 +12,8 @@ import {
   followUpAllowed,
   leadDedupeKey,
   normalizeEmail,
-  normalizeUrl
+  normalizeUrl,
+  outreachIsEnabled
 } from "./sales-policy";
 import {
   LEAD_CATEGORIES,
@@ -383,6 +384,7 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       .map((row) => this.mapDraft(row));
     return json({
       mode: this.env.EMAIL_MODE || "draft_only",
+      outreachEnabled: outreachIsEnabled(this.env.OUTREACH_ENABLED),
       limits: {
         newLeadsPerDay: boundedInt(this.env.MAX_DAILY_NEW_LEADS, 20, 100),
         sendsPerDay: boundedInt(this.env.MAX_DAILY_SENDS, 5, 25)
@@ -633,6 +635,8 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   }
 
   private async sendApprovedDraft(id: string) {
+    if (!outreachIsEnabled(this.env.OUTREACH_ENABLED))
+      return json({ error: "OUTREACH_ENABLED is false; sending is disabled" }, 409);
     if ((this.env.EMAIL_MODE || "draft_only") === "draft_only")
       return json({ error: "EMAIL_MODE is draft_only; sending is disabled" }, 409);
     const draft = this.draft(id);

@@ -4,10 +4,11 @@ ALLOW_LOCAL_BEARER_AUTH=true
 CF_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
 CF_ACCESS_AUD=your-access-application-audience-tag
 
-# Keep draft_only until the full Gmail setup has been reviewed.
-EMAIL_MODE=draft_only
+# Safe test mode: mock provider with the provider-call kill switch disabled.
+EMAIL_MODE=mock
+OUTREACH_ENABLED=false
 
-# Gmail OAuth secrets. Leave empty while EMAIL_MODE=draft_only.
+# Gmail OAuth secrets. Leave empty in safe test mode.
 GMAIL_CLIENT_ID=
 GMAIL_CLIENT_SECRET=
 GMAIL_REFRESH_TOKEN=

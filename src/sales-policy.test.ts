@@ -5,7 +5,8 @@ import {
   canContact,
   canTransition,
   followUpAllowed,
-  leadDedupeKey
+  leadDedupeKey,
+  outreachIsEnabled
 } from "./sales-policy";
 import type { LeadInput } from "./sales-types";
 
@@ -20,6 +21,12 @@ const leadInput: LeadInput = {
 };
 
 describe("lead policy", () => {
+  it("keeps outreach disabled unless explicitly enabled", () => {
+    expect(outreachIsEnabled(undefined)).toBe(false);
+    expect(outreachIsEnabled("false")).toBe(false);
+    expect(outreachIsEnabled("true")).toBe(true);
+  });
+
   it("deduplicates by normalized website host", () => {
     expect(leadDedupeKey(leadInput)).toBe("website:example.ma");
     expect(

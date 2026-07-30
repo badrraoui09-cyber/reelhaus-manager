@@ -1,7 +1,9 @@
 # ReelHaus Manager
 
 Private Cloudflare Agent for the ReelHaus website guardian and controlled sales
-outreach. The default mode is `draft_only`: deployment alone cannot send email.
+outreach. The safe test configuration uses `EMAIL_MODE=mock` together with the
+independent kill switch `OUTREACH_ENABLED=false`; deployment cannot call an
+email provider.
 
 ## Safety model
 
@@ -17,6 +19,8 @@ outreach. The default mode is `draft_only`: deployment alone cannot send email.
 - Editing invalidates an existing approval.
 - One current approval is atomically consumed before the provider call and can
   trigger at most one provider attempt.
+- `OUTREACH_ENABLED=false` blocks every provider call before an approval is
+  consumed.
 - Reply, bounce, opt-out and `do_not_contact` stop pending follow-ups.
 - At most two follow-up drafts are allowed, with seven days between contacts by
   default.
@@ -100,19 +104,21 @@ pnpm dev
 
 Configured in `wrangler.jsonc`:
 
-- `EMAIL_MODE=draft_only`
+- `EMAIL_MODE=mock`
+- `OUTREACH_ENABLED=false`
 - `MAX_DAILY_NEW_LEADS=20`
 - `MAX_DAILY_SENDS=5`
 - `MIN_FOLLOW_UP_DAYS=7`
 
 Supported email modes:
 
-- `draft_only` — default; no provider call and no send;
+- `draft_only` — no provider call and no send;
 - `mock` — tests the complete approval flow without real email;
 - `gmail` — creates a Gmail draft and sends it only after a current approval.
 
-Review the code, Cloudflare Access and Gmail setup before changing
-`EMAIL_MODE`.
+`OUTREACH_ENABLED` must also be explicitly changed to `true` before any provider
+call is possible. Review the code, Cloudflare Access and Gmail setup before
+changing either safety setting.
 
 ## Required bindings
 
@@ -225,6 +231,7 @@ Tests cover:
 - transparent score calculation;
 - allowed status transitions;
 - permanent do-not-contact enforcement;
+- outreach kill-switch enforcement;
 - follow-up count and interval limits;
 - current, single-use approval rules;
 - opt-out requirement;
@@ -237,13 +244,13 @@ Automated tests never select the Gmail provider with real credentials.
 
 ## Not activated
 
-- real Gmail sending (`EMAIL_MODE` stays `draft_only`);
+- real Gmail sending (`EMAIL_MODE=mock`, no Gmail secrets);
+- all provider calls (`OUTREACH_ENABLED=false`);
 - automatic inbox reading or Gmail reply polling;
 - Gmail Pub/Sub watch/webhook;
 - automated Google Maps discovery;
 - automatic sending of initial or follow-up email;
 - external list imports;
-- deployment.
 
 Replies, bounces and opt-outs can currently be recorded through the authenticated
 event endpoint/dashboard workflow. Automatic Gmail inbox synchronization would

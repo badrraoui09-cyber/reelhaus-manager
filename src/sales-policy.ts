@@ -5,6 +5,10 @@ import type {
   ObservedIssue
 } from "./sales-types";
 
+export function outreachIsEnabled(value: string | undefined): boolean {
+  return value === "true";
+}
+
 const ALLOWED_TRANSITIONS: Record<LeadStatus, readonly LeadStatus[]> = {
   discovered: ["qualified", "lost", "do_not_contact"],
   qualified: ["draft_ready", "lost", "do_not_contact"],
