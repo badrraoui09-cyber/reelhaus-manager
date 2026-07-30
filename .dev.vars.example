@@ -1,8 +1,12 @@
 # Copy to .dev.vars for local development. Never commit .dev.vars.
+# The bearer token is a local-development fallback only.
 GUARDIAN_API_TOKEN=replace-with-a-long-random-secret
 ALLOW_LOCAL_BEARER_AUTH=true
-CF_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
-CF_ACCESS_AUD=your-access-application-audience-tag
+
+# Optional for local Access testing. Copy real values from Cloudflare; do not
+# invent them or commit them. Production stores both as Worker secrets.
+CF_ACCESS_TEAM_DOMAIN=
+CF_ACCESS_AUD=
 
 # Safe test mode: mock provider with the provider-call kill switch disabled.
 EMAIL_MODE=mock
