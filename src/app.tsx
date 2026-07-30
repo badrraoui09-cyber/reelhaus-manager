@@ -16,6 +16,44 @@ interface SalesSnapshot {
   drafts: EmailDraft[];
 }
 
+type AccessErrorCode =
+  | "ACCESS_NOT_CONFIGURED"
+  | "ACCESS_LOGIN_REQUIRED"
+  | "ACCESS_JWT_REJECTED";
+
+class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string
+  ) {
+    super(message);
+  }
+}
+
+function accessMessage(code: AccessErrorCode | null): {
+  title: string;
+  detail: string;
+} {
+  if (code === "ACCESS_NOT_CONFIGURED")
+    return {
+      title: "Cloudflare Access ist nicht konfiguriert",
+      detail:
+        "Für diesen Worker fehlen die Access-Anwendung oder ihre sicheren Team-Domain- und AUD-Werte."
+    };
+  if (code === "ACCESS_JWT_REJECTED")
+    return {
+      title: "Cloudflare-Access-Token abgelehnt",
+      detail:
+        "Die Anmeldung wurde erkannt, aber das Access-JWT konnte nicht für diese Anwendung bestätigt werden."
+    };
+  return {
+    title: "Nicht über Cloudflare Access angemeldet",
+    detail:
+      "Lade die Seite neu. Sobald Access für diese Adresse aktiviert ist, führt Cloudflare zur Anmeldung."
+  };
+}
+
 function Summary({ summary }: { summary: ReportSummary }) {
   return (
     <div className="summary">
@@ -31,9 +69,10 @@ export default function App() {
     () => sessionStorage.getItem("guardian-token") || ""
   );
   const [draftToken, setDraftToken] = useState("");
-  const [accessMode, setAccessMode] = useState(
-    () => sessionStorage.getItem("access-mode") === "cloudflare"
+  const [authState, setAuthState] = useState<"checking" | "ready" | "blocked">(
+    "checking"
   );
+  const [accessError, setAccessError] = useState<AccessErrorCode | null>(null);
   const [tab, setTab] = useState<"sales" | "guardian">("sales");
   const [sales, setSales] = useState<SalesSnapshot | null>(null);
   const [report, setReport] = useState<AuditReport | null>(null);
@@ -50,7 +89,7 @@ export default function App() {
     language: "fr" as "fr" | "ar"
   });
 
-  const authenticated = accessMode || Boolean(token);
+  const authenticated = authState === "ready";
 
   const api = useCallback(async function requestApi<T>(
     path: string,
@@ -59,10 +98,21 @@ export default function App() {
       const headers = new Headers(init?.headers);
       if (token) headers.set("authorization", `Bearer ${token}`);
       if (init?.body) headers.set("content-type", "application/json");
-      const response = await fetch(path, { ...init, headers });
-      const payload = (await response.json()) as T & { error?: string };
+      const response = await fetch(path, {
+        ...init,
+        headers,
+        credentials: "same-origin"
+      });
+      const payload = (await response.json()) as T & {
+        code?: string;
+        error?: string;
+      };
       if (!response.ok)
-        throw new Error(payload.error || `HTTP ${response.status}`);
+        throw new ApiRequestError(
+          payload.error || `HTTP ${response.status}`,
+          response.status,
+          payload.code
+        );
       return payload;
     },
     [token]
@@ -71,15 +121,33 @@ export default function App() {
   const loadSales = useCallback(async () => {
     try {
       setSales(await api<SalesSnapshot>("/api/sales"));
+      setAuthState("ready");
+      setAccessError(null);
       setError("");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Abruf fehlgeschlagen");
+      if (caught instanceof ApiRequestError && caught.status === 401) {
+        setSales(null);
+        setAuthState("blocked");
+        setAccessError(
+          caught.code === "ACCESS_NOT_CONFIGURED" ||
+            caught.code === "ACCESS_LOGIN_REQUIRED" ||
+            caught.code === "ACCESS_JWT_REJECTED"
+            ? caught.code
+            : "ACCESS_LOGIN_REQUIRED"
+        );
+        setError("");
+      } else {
+        setAuthState("ready");
+        setError(
+          caught instanceof Error ? caught.message : "Abruf fehlgeschlagen"
+        );
+      }
     }
   }, [api]);
 
   useEffect(() => {
-    if (authenticated) void loadSales();
-  }, [authenticated, loadSales]);
+    void loadSales();
+  }, [loadSales]);
 
   async function action(path: string, body?: unknown, method = "POST") {
     setBusy(true);
@@ -120,38 +188,48 @@ export default function App() {
   }
 
   if (!authenticated) {
+    const problem = accessMessage(accessError);
     return (
       <main className="login">
         <section className="panel">
           <p className="eyebrow">Private Operations</p>
           <h1>ReelHaus Manager</h1>
-          <p>Mit Cloudflare Access fortfahren oder lokales Token verwenden.</p>
-          <button
-            onClick={() => {
-              sessionStorage.setItem("access-mode", "cloudflare");
-              setAccessMode(true);
-            }}
-          >
-            Cloudflare Access verwenden
-          </button>
-          <div className="separator">oder lokal</div>
-          <label htmlFor="token">Guardian API Token</label>
-          <input
-            id="token"
-            type="password"
-            value={draftToken}
-            onChange={(event) => setDraftToken(event.target.value)}
-          />
-          <button
-            className="secondary"
-            disabled={!draftToken.trim()}
-            onClick={() => {
-              sessionStorage.setItem("guardian-token", draftToken.trim());
-              setToken(draftToken.trim());
-            }}
-          >
-            Mit Token öffnen
-          </button>
+          {authState === "checking" ? (
+            <p>Zugriff wird sicher geprüft…</p>
+          ) : (
+            <>
+              <div className="error" role="alert">
+                <strong>{problem.title}</strong>
+                <p>{problem.detail}</p>
+              </div>
+              <button onClick={() => window.location.reload()}>
+                Neu laden / über Cloudflare Access anmelden
+              </button>
+            </>
+          )}
+          {import.meta.env.DEV && (
+            <>
+              <div className="separator">nur lokale Entwicklung</div>
+              <label htmlFor="token">Guardian API Token</label>
+              <input
+                id="token"
+                type="password"
+                value={draftToken}
+                onChange={(event) => setDraftToken(event.target.value)}
+              />
+              <button
+                className="secondary"
+                disabled={!draftToken.trim()}
+                onClick={() => {
+                  sessionStorage.setItem("guardian-token", draftToken.trim());
+                  setToken(draftToken.trim());
+                  setAuthState("checking");
+                }}
+              >
+                Lokales Token verwenden
+              </button>
+            </>
+          )}
         </section>
       </main>
     );
@@ -175,9 +253,11 @@ export default function App() {
           <button
             className="secondary"
             onClick={() => {
-              sessionStorage.clear();
+              sessionStorage.removeItem("guardian-token");
               setToken("");
-              setAccessMode(false);
+              setSales(null);
+              setAuthState("checking");
+              window.location.reload();
             }}
           >
             Sperren
