@@ -1,5 +1,6 @@
 export { ReelHausManager } from "./sales-agent";
 import { verifyCloudflareAccess } from "./access-auth";
+import { isApiPath, isKnownApiRoute } from "./server-routing";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -74,7 +75,11 @@ async function runScheduledDiscovery(env: WorkerEnv): Promise<void> {
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) return routeApi(request, env);
+    if (isApiPath(url.pathname)) {
+      if (!isKnownApiRoute(request.method, url.pathname))
+        return json({ error: "Not found" }, 404);
+      return routeApi(request, env);
+    }
     if (request.method !== "GET" && request.method !== "HEAD")
       return json({ error: "Method not allowed" }, 405);
     return env.ASSETS.fetch(request);
