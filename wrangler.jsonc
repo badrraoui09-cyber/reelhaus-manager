@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "reelhaus-manager",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-06-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "vars": {
+    "ALLOW_LOCAL_BEARER_AUTH": "false",
+    "EMAIL_MODE": "draft_only",
+    "MAX_DAILY_NEW_LEADS": "20",
+    "MAX_DAILY_SENDS": "5",
+    "MIN_FOLLOW_UP_DAYS": "7"
+  },
+  "triggers": {
+    "crons": ["0 7 * * *"]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"],
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "ReelHausManager",
+        "name": "REELHAUS_MANAGER"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["ReelHausManager"],
+      "tag": "v1"
+    }
+  ]
+}
