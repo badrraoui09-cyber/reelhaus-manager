@@ -24,7 +24,7 @@ function robotsAllows(robots: string, pathname: string): boolean {
 }
 
 export async function analyzePublicBusinessWebsite(
-  browserBinding: BrowserRun,
+  browserBinding: BrowserRun | Fetcher,
   websiteUrl: string
 ): Promise<PublicWebsiteObservation> {
   const url = new URL(websiteUrl);

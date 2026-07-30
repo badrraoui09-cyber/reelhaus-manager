@@ -24,7 +24,7 @@ async function identity(
   const accessIdentity = await verifyCloudflareAccess(request, env);
   if (accessIdentity) return accessIdentity;
   if (
-    env.ALLOW_LOCAL_BEARER_AUTH === "true" &&
+    String(env.ALLOW_LOCAL_BEARER_AUTH) === "true" &&
     env.GUARDIAN_API_TOKEN &&
     request.headers.get("authorization") === `Bearer ${env.GUARDIAN_API_TOKEN}`
   )
