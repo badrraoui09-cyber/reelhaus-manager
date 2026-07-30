@@ -1,6 +1,25 @@
-interface AccessConfig {
+export interface AccessConfig {
   CF_ACCESS_TEAM_DOMAIN?: string;
   CF_ACCESS_AUD?: string;
+}
+
+interface DiagnosticConfig extends AccessConfig {
+  EMAIL_MODE?: string;
+  OUTREACH_ENABLED?: string;
+}
+
+export type AccessValidationResult =
+  | { status: "authenticated"; identity: string }
+  | {
+      status: "not_configured" | "missing_jwt" | "rejected";
+      identity?: never;
+    };
+
+export interface AccessDiagnostic {
+  accessConfigured: boolean;
+  accessJwtPresent: boolean;
+  emailMode: string;
+  outreachEnabled: boolean;
 }
 
 interface JwtHeader {
@@ -31,21 +50,49 @@ function bytes(value: string): Uint8Array<ArrayBuffer> {
   return new TextEncoder().encode(value);
 }
 
-export async function verifyCloudflareAccess(
+function normalizedTeamDomain(config: AccessConfig): string {
+  return (
+    config.CF_ACCESS_TEAM_DOMAIN?.trim()
+      .replace(/^https?:\/\//, "")
+      .replace(/\/$/, "") || ""
+  );
+}
+
+export function accessIsConfigured(config: AccessConfig): boolean {
+  return Boolean(normalizedTeamDomain(config) && config.CF_ACCESS_AUD?.trim());
+}
+
+export function accessDiagnostic(
+  request: Request,
+  config: DiagnosticConfig
+): AccessDiagnostic {
+  return {
+    accessConfigured: accessIsConfigured(config),
+    accessJwtPresent: Boolean(
+      request.headers.get("cf-access-jwt-assertion")?.trim()
+    ),
+    emailMode: String(config.EMAIL_MODE || "draft_only"),
+    outreachEnabled: String(config.OUTREACH_ENABLED) === "true"
+  };
+}
+
+export async function validateCloudflareAccess(
   request: Request,
   config: AccessConfig
-): Promise<string | null> {
+): Promise<AccessValidationResult> {
   const token = request.headers.get("cf-access-jwt-assertion");
-  const teamDomain = config.CF_ACCESS_TEAM_DOMAIN?.replace(/^https?:\/\//, "").replace(/\/$/, "");
-  const expectedAud = config.CF_ACCESS_AUD;
-  if (!token || !teamDomain || !expectedAud) return null;
+  const teamDomain = normalizedTeamDomain(config);
+  const expectedAud = config.CF_ACCESS_AUD?.trim();
+  if (!teamDomain || !expectedAud) return { status: "not_configured" };
+  if (!token) return { status: "missing_jwt" };
   const parts = token.split(".");
-  if (parts.length !== 3) return null;
+  if (parts.length !== 3) return { status: "rejected" };
 
   try {
     const header = decodePart<JwtHeader>(parts[0]);
     const payload = decodePart<JwtPayload>(parts[1]);
-    if (header.alg !== "RS256" || !header.kid || !payload.email) return null;
+    if (header.alg !== "RS256" || !header.kid || !payload.email)
+      return { status: "rejected" };
     const now = Math.floor(Date.now() / 1000);
     const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
     if (
@@ -55,15 +102,15 @@ export async function verifyCloudflareAccess(
       payload.exp <= now ||
       (payload.nbf !== undefined && payload.nbf > now)
     )
-      return null;
+      return { status: "rejected" };
 
     const response = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, {
       signal: AbortSignal.timeout(5_000)
     });
-    if (!response.ok) return null;
+    if (!response.ok) return { status: "rejected" };
     const jwks = (await response.json()) as JwkSet;
     const jwk = jwks.keys.find((key) => key.kid === header.kid);
-    if (!jwk) return null;
+    if (!jwk) return { status: "rejected" };
     const key = await crypto.subtle.importKey(
       "jwk",
       jwk,
@@ -84,8 +131,10 @@ export async function verifyCloudflareAccess(
       signature,
       bytes(`${parts[0]}.${parts[1]}`)
     );
-    return valid ? payload.email : null;
+    return valid
+      ? { status: "authenticated", identity: payload.email }
+      : { status: "rejected" };
   } catch {
-    return null;
+    return { status: "rejected" };
   }
 }
