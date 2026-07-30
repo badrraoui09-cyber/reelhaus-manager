@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   LEAD_CATEGORIES,
   type EmailDraft,
@@ -51,28 +51,34 @@ export default function App() {
 
   const authenticated = accessMode || Boolean(token);
 
-  async function api<T>(path: string, init?: RequestInit): Promise<T> {
-    const headers = new Headers(init?.headers);
-    if (token) headers.set("authorization", `Bearer ${token}`);
-    if (init?.body) headers.set("content-type", "application/json");
-    const response = await fetch(path, { ...init, headers });
-    const payload = (await response.json()) as T & { error?: string };
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    return payload;
-  }
+  const api = useCallback(async function requestApi<T>(
+    path: string,
+    init?: RequestInit
+  ): Promise<T> {
+      const headers = new Headers(init?.headers);
+      if (token) headers.set("authorization", `Bearer ${token}`);
+      if (init?.body) headers.set("content-type", "application/json");
+      const response = await fetch(path, { ...init, headers });
+      const payload = (await response.json()) as T & { error?: string };
+      if (!response.ok)
+        throw new Error(payload.error || `HTTP ${response.status}`);
+      return payload;
+    },
+    [token]
+  );
 
-  async function loadSales() {
+  const loadSales = useCallback(async () => {
     try {
       setSales(await api<SalesSnapshot>("/api/sales"));
       setError("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Abruf fehlgeschlagen");
     }
-  }
+  }, [api]);
 
   useEffect(() => {
     if (authenticated) void loadSales();
-  }, [authenticated, token]);
+  }, [authenticated, loadSales]);
 
   async function action(path: string, body?: unknown, method = "POST") {
     setBusy(true);

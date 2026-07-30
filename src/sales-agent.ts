@@ -38,6 +38,8 @@ type SalesEnv = Env & {
   MIN_FOLLOW_UP_DAYS?: string;
 };
 
+type SqlRow = Record<string, SqlStorageValue>;
+
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store"
@@ -380,11 +382,11 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
 
   private salesSnapshot() {
     const leads = this.ctx.storage.sql
-      .exec<Record<string, unknown>>("SELECT * FROM leads ORDER BY created_at DESC LIMIT 200")
+      .exec<SqlRow>("SELECT * FROM leads ORDER BY created_at DESC LIMIT 200")
       .toArray()
       .map((row) => this.mapLead(row));
     const drafts = this.ctx.storage.sql
-      .exec<Record<string, unknown>>("SELECT * FROM drafts ORDER BY created_at DESC LIMIT 200")
+      .exec<SqlRow>("SELECT * FROM drafts ORDER BY created_at DESC LIMIT 200")
       .toArray()
       .map((row) => this.mapDraft(row));
     return json({
@@ -399,7 +401,7 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
     });
   }
 
-  private mapLead(row: Record<string, unknown>): Lead {
+  private mapLead(row: SqlRow): Lead {
     return {
       id: String(row.id),
       businessName: String(row.business_name),
@@ -432,7 +434,7 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
     };
   }
 
-  private mapDraft(row: Record<string, unknown>): EmailDraft {
+  private mapDraft(row: SqlRow): EmailDraft {
     return {
       id: String(row.id),
       leadId: String(row.lead_id),
@@ -453,14 +455,14 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
 
   private lead(id: string): Lead | null {
     const row = this.ctx.storage.sql
-      .exec<Record<string, unknown>>("SELECT * FROM leads WHERE id = ?", id)
+      .exec<SqlRow>("SELECT * FROM leads WHERE id = ?", id)
       .toArray()[0];
     return row ? this.mapLead(row) : null;
   }
 
   private draft(id: string): EmailDraft | null {
     const row = this.ctx.storage.sql
-      .exec<Record<string, unknown>>("SELECT * FROM drafts WHERE id = ?", id)
+      .exec<SqlRow>("SELECT * FROM drafts WHERE id = ?", id)
       .toArray()[0];
     return row ? this.mapDraft(row) : null;
   }

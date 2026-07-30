@@ -1,7 +1,4 @@
-interface Env {
-  ASSETS: Fetcher;
-  BROWSER: Fetcher;
-  REELHAUS_MANAGER: DurableObjectNamespace;
+interface Env extends Cloudflare.Env {
   GUARDIAN_API_TOKEN?: string;
   ALLOW_LOCAL_BEARER_AUTH?: string;
   CF_ACCESS_TEAM_DOMAIN?: string;

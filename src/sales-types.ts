@@ -55,9 +55,10 @@ export interface LeadInput {
   language?: OutreachLanguage;
 }
 
-export interface Lead extends LeadInput {
+export interface Lead extends Omit<LeadInput, "observedIssues"> {
   id: string;
   country: "MA";
+  observedIssues: ObservedIssue[];
   discoveredAt: string;
   score: number;
   scoreReasons: string[];
