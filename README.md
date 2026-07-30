@@ -31,7 +31,7 @@ email provider.
 
 ```text
 Cloudflare Access
-       │ verified Access JWT (or local dev token)
+       │ verified Access JWT (or local-development token)
        ▼
 Worker + React dashboard
        │
@@ -142,32 +142,39 @@ Set these through Cloudflare Secrets; never put their real values in the
 repository:
 
 ```bash
-pnpm exec wrangler secret put GUARDIAN_API_TOKEN
 pnpm exec wrangler secret put CF_ACCESS_TEAM_DOMAIN
 pnpm exec wrangler secret put CF_ACCESS_AUD
-pnpm exec wrangler secret put GMAIL_CLIENT_ID
-pnpm exec wrangler secret put GMAIL_CLIENT_SECRET
-pnpm exec wrangler secret put GMAIL_REFRESH_TOKEN
 ```
 
-`GUARDIAN_API_TOKEN` is only a local/API fallback. Production uses Cloudflare
-Access. `ALLOW_LOCAL_BEARER_AUTH` is `false` in `wrangler.jsonc`; enable it only
-in local `.dev.vars`.
+Copy `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` from the real Cloudflare Access
+application. Never guess either value. `GUARDIAN_API_TOKEN` belongs only in a
+local `.dev.vars` file; do not create it as a production secret.
+`ALLOW_LOCAL_BEARER_AUTH` is `false` in `wrangler.jsonc` and must remain false
+in production.
 
 ## Cloudflare Access
 
-1. Deploy only after review and approval.
-2. In Workers & Pages, select the Worker and enable Cloudflare Access for its
-   route, including preview deployments if required.
-3. Create an Allow policy limited to Badr Raoui or explicitly authorized users.
-4. Do not add an Everyone/Bypass policy.
-5. Copy the Access application audience tag to `CF_ACCESS_AUD`.
-6. Set `CF_ACCESS_TEAM_DOMAIN`, for example
-   `team-name.cloudflareaccess.com`.
+1. In Workers & Pages, open `reelhaus-manager`.
+2. Go to Settings > Domains & Routes.
+3. On `reelhaus-manager.badrraoui09.workers.dev`, select **Enable Cloudflare
+   Access**.
+4. Open **Manage Cloudflare Access** and configure the generated Self-hosted
+   application.
+5. Add an **Allow** policy whose Include rule is the explicitly authorized
+   email address. Do not add Everyone, Bypass or email-domain-wide access.
+6. In Zero Trust > Settings, copy the actual team domain, including
+   `.cloudflareaccess.com`, to the `CF_ACCESS_TEAM_DOMAIN` Worker secret.
+7. In Zero Trust > Access controls > Applications, configure the ReelHaus
+   application and copy its Application Audience (AUD) tag from Additional
+   settings to the `CF_ACCESS_AUD` Worker secret.
+8. Reload the Worker URL and complete the Access login before testing the API.
 
 The Worker verifies the `Cf-Access-Jwt-Assertion` signature against Cloudflare's
 JWKS and checks issuer, audience and expiry. It does not trust a caller-supplied
-email header.
+email header. API authentication failures distinguish missing configuration,
+missing login and a rejected JWT without returning secrets or token details.
+The production dashboard sends same-origin credentials explicitly and does not
+show the local bearer-token form.
 
 ## Gmail OAuth setup
 
@@ -212,6 +219,7 @@ claims or guarantees, and includes a polite permanent opt-out.
 All `/api/*` routes require a valid Cloudflare Access JWT or the local bearer
 token.
 
+- `GET /api/auth/diagnostic`
 - `GET /api/sales`
 - `POST /api/discovery/queue`
 - `POST /api/discovery/run`
@@ -226,6 +234,10 @@ token.
 - `POST /api/scan`
 - `GET /api/reports`
 - `GET /api/reports/:id`
+
+The protected diagnostic route returns only `accessConfigured`,
+`accessJwtPresent`, `emailMode` and `outreachEnabled`. It never returns a token,
+JWT, email address, issuer, secret or request headers.
 
 No OAuth callback, MCP, DNS, Netlify, GitHub or publishing endpoint is exposed.
 
