@@ -637,7 +637,7 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   private async sendApprovedDraft(id: string) {
     if (!outreachIsEnabled(this.env.OUTREACH_ENABLED))
       return json({ error: "OUTREACH_ENABLED is false; sending is disabled" }, 409);
-    if ((this.env.EMAIL_MODE || "draft_only") === "draft_only")
+    if (String(this.env.EMAIL_MODE || "draft_only") === "draft_only")
       return json({ error: "EMAIL_MODE is draft_only; sending is disabled" }, 409);
     const draft = this.draft(id);
     if (!draft || draft.status !== "approved")
