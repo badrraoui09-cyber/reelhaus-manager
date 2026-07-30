@@ -20,7 +20,7 @@
     "format": "oxfmt --write .",
     "lint": "oxlint src/",
     "check": "oxlint src/ && tsc",
-    "test": "vitest run"
+    "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.1.0",

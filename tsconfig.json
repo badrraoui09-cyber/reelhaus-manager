@@ -11,5 +11,5 @@
     "types": ["node", "vite/client"],
     "allowImportingTsExtensions": true
   },
-  "include": ["src", "vite.config.ts", "env.d.ts"]
+  "include": ["src", "vite.config.ts", "vitest.config.ts", "env.d.ts"]
 }
