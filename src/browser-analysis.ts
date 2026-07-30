@@ -24,7 +24,7 @@ function robotsAllows(robots: string, pathname: string): boolean {
 }
 
 export async function analyzePublicBusinessWebsite(
-  browserBinding: Fetcher,
+  browserBinding: BrowserRun,
   websiteUrl: string
 ): Promise<PublicWebsiteObservation> {
   const url = new URL(websiteUrl);
@@ -46,7 +46,9 @@ export async function analyzePublicBusinessWebsite(
     }
   }
 
-  const browser = await puppeteer.launch(browserBinding);
+  // Wrangler's BrowserRun and Puppeteer's Fetcher declarations describe the
+  // same runtime binding but currently expose different helper methods.
+  const browser = await puppeteer.launch(browserBinding as unknown as Fetcher);
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 1 });

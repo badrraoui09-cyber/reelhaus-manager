@@ -28,15 +28,7 @@ import {
 import type { AuditReport, ReportSummary } from "./website-analysis";
 import { analyzeReelHaus } from "./website-analysis";
 
-type SalesEnv = Env & {
-  EMAIL_MODE?: "draft_only" | "mock" | "gmail";
-  GMAIL_CLIENT_ID?: string;
-  GMAIL_CLIENT_SECRET?: string;
-  GMAIL_REFRESH_TOKEN?: string;
-  MAX_DAILY_NEW_LEADS?: string;
-  MAX_DAILY_SENDS?: string;
-  MIN_FOLLOW_UP_DAYS?: string;
-};
+type SalesEnv = Env;
 
 type SqlRow = Record<string, SqlStorageValue>;
 
