@@ -96,9 +96,15 @@ Safe local commands:
 ```bash
 pnpm check
 pnpm test
-pnpm exec vite build
+pnpm build
 pnpm dev
 ```
+
+This is a Cloudflare Vite-plugin project. The input `wrangler.jsonc` deliberately
+does not set `assets.directory`; `vite build` generates the deployment
+configuration and points it at `dist/client`. Always run the Vite build before
+`wrangler deploy`. Cloudflare Workers Builds must use `npm run build` as the
+build command and `npx wrangler deploy` as the deploy command.
 
 ### Non-secret variables
 
