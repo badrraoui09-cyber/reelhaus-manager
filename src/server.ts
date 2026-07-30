@@ -1,5 +1,9 @@
 export { ReelHausManager } from "./sales-agent";
-import { verifyCloudflareAccess } from "./access-auth";
+import {
+  accessDiagnostic,
+  validateCloudflareAccess,
+  type AccessValidationResult
+} from "./access-auth";
 import { isApiPath, isKnownApiRoute } from "./server-routing";
 
 const JSON_HEADERS = {
@@ -14,37 +18,68 @@ type WorkerEnv = Env & {
   CF_ACCESS_AUD?: string;
 };
 
+type AuthResult =
+  | { identity: string; access: AccessValidationResult }
+  | { identity?: never; access: AccessValidationResult };
+
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: JSON_HEADERS });
 }
 
-async function identity(
+async function authenticate(
   request: Request,
   env: WorkerEnv
-): Promise<string | null> {
-  const accessIdentity = await verifyCloudflareAccess(request, env);
-  if (accessIdentity) return accessIdentity;
+): Promise<AuthResult> {
+  const access = await validateCloudflareAccess(request, env);
+  if (access.status === "authenticated")
+    return { identity: access.identity, access };
   if (
     String(env.ALLOW_LOCAL_BEARER_AUTH) === "true" &&
     env.GUARDIAN_API_TOKEN &&
     request.headers.get("authorization") === `Bearer ${env.GUARDIAN_API_TOKEN}`
   )
-    return "local-token-user";
-  return null;
+    return { identity: "local-token-user", access };
+  return { access };
+}
+
+function authenticationError(access: AccessValidationResult): {
+  code: string;
+  error: string;
+} {
+  if (access.status === "not_configured")
+    return {
+      code: "ACCESS_NOT_CONFIGURED",
+      error: "Cloudflare Access is not configured"
+    };
+  if (access.status === "missing_jwt")
+    return {
+      code: "ACCESS_LOGIN_REQUIRED",
+      error: "Not logged in through Cloudflare Access"
+    };
+  return {
+    code: "ACCESS_JWT_REJECTED",
+    error: "Cloudflare Access JWT rejected"
+  };
+}
+
+async function routeAccessDiagnostic(
+  request: Request,
+  env: WorkerEnv
+): Promise<Response> {
+  const auth = await authenticate(request, env);
+  return json(accessDiagnostic(request, env), auth.identity ? 200 : 401);
 }
 
 async function routeApi(request: Request, env: WorkerEnv): Promise<Response> {
-  const authenticatedIdentity = await identity(request, env);
-  if (!authenticatedIdentity) {
-    return json({ error: "Cloudflare Access or local bearer auth required" }, 401);
-  }
+  const auth = await authenticate(request, env);
+  if (!auth.identity) return json(authenticationError(auth.access), 401);
   const incoming = new URL(request.url);
   const internalPath = incoming.pathname.replace(/^\/api/, "") || "/";
   const internalUrl = new URL(internalPath + incoming.search, incoming.origin);
   const id = env.REELHAUS_MANAGER.idFromName("reelhaus-manager");
   const headers = new Headers(request.headers);
   headers.delete("x-reelhaus-approver");
-  headers.set("x-reelhaus-approver", authenticatedIdentity);
+  headers.set("x-reelhaus-approver", auth.identity);
   return env.REELHAUS_MANAGER.get(id).fetch(
     new Request(internalUrl, {
       method: request.method,
@@ -78,6 +113,11 @@ export default {
     if (isApiPath(url.pathname)) {
       if (!isKnownApiRoute(request.method, url.pathname))
         return json({ error: "Not found" }, 404);
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/auth/diagnostic"
+      )
+        return routeAccessDiagnostic(request, env);
       return routeApi(request, env);
     }
     if (request.method !== "GET" && request.method !== "HEAD")
