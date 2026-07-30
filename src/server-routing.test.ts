@@ -3,6 +3,7 @@ import { isApiPath, isKnownApiRoute } from "./server-routing";
 
 describe("Worker route classification", () => {
   it("recognizes protected API routes", () => {
+    expect(isKnownApiRoute("GET", "/api/auth/diagnostic")).toBe(true);
     expect(isKnownApiRoute("GET", "/api/sales")).toBe(true);
     expect(isKnownApiRoute("POST", "/api/scan")).toBe(true);
     expect(
