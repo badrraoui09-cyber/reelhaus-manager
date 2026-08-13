@@ -7,19 +7,42 @@ const API_ROUTES: ReadonlyArray<{
   { method: "GET", pathname: /^\/api\/reports$/ },
   { method: "GET", pathname: /^\/api\/reports\/[^/]+$/ },
   { method: "GET", pathname: /^\/api\/sales$/ },
+  { method: "GET", pathname: /^\/api\/businesses\/search$/ },
+  {
+    method: "GET",
+    pathname: /^\/api\/businesses\/[^/]+\/workspace$/
+  },
+  { method: "GET", pathname: /^\/api\/reelscan\/export$/ },
   { method: "POST", pathname: /^\/api\/discovery\/queue$/ },
   { method: "POST", pathname: /^\/api\/discovery\/run$/ },
+  {
+    method: "POST",
+    pathname: /^\/api\/discovery\/candidates\/[^/]+\/reelscan$/
+  },
+  {
+    method: "POST",
+    pathname: /^\/api\/discovery\/candidates\/[^/]+\/scan$/
+  },
+  {
+    method: "POST",
+    pathname: /^\/api\/discovery\/candidates\/[^/]+\/decision$/
+  },
   { method: "PATCH", pathname: /^\/api\/leads\/[^/]+$/ },
+  { method: "POST", pathname: /^\/api\/leads\/[^/]+\/audit$/ },
+  { method: "POST", pathname: /^\/api\/leads\/[^/]+\/qualify$/ },
   { method: "POST", pathname: /^\/api\/leads\/[^/]+\/draft$/ },
+  { method: "POST", pathname: /^\/api\/leads\/[^/]+\/quality-review$/ },
   { method: "POST", pathname: /^\/api\/leads\/[^/]+\/events$/ },
   {
     method: "POST",
     pathname: /^\/api\/leads\/[^/]+\/do-not-contact$/
   },
   { method: "PATCH", pathname: /^\/api\/drafts\/[^/]+$/ },
+  { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/review$/ },
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/approve$/ },
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/reject$/ },
-  { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/send$/ }
+  { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/send$/ },
+  { method: "POST", pathname: /^\/api\/assistant$/ }
 ];
 
 export function isApiPath(pathname: string): boolean {

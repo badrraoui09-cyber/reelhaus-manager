@@ -12,6 +12,11 @@ CF_ACCESS_AUD=
 EMAIL_MODE=mock
 OUTREACH_ENABLED=false
 
+# Optional comma-separated public directory/source pages. The Discovery Agent
+# reads at most five source pages per daily run and respects robots.txt.
+DISCOVERY_SOURCE_URLS=
+DISCOVERY_OSM_ENABLED=false
+
 # Gmail OAuth secrets. Leave empty in safe test mode.
 GMAIL_CLIENT_ID=
 GMAIL_CLIENT_SECRET=

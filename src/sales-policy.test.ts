@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  calculateLeadScore,
   approvalIsUsable,
   canContact,
   canTransition,
@@ -32,27 +31,6 @@ describe("lead policy", () => {
     expect(
       leadDedupeKey({ ...leadInput, websiteUrl: "https://example.ma/" })
     ).toBe("website:example.ma");
-  });
-
-  it("uses transparent capped scoring", () => {
-    const result = calculateLeadScore({
-      websiteUrl: leadInput.websiteUrl,
-      publicEmail: leadInput.publicEmail,
-      category: leadInput.category,
-      city: leadInput.city,
-      issues: [
-        {
-          code: "mobile",
-          detail: "Viewport missing",
-          sourceUrl: "https://example.ma",
-          observedAt: "2026-07-30T00:00:00.000Z",
-          verified: true,
-          points: 20
-        }
-      ]
-    });
-    expect(result.score).toBe(60);
-    expect(result.reasons).toHaveLength(4);
   });
 
   it("enforces status and do-not-contact rules", () => {

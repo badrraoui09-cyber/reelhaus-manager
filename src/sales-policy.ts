@@ -1,21 +1,25 @@
-import type {
-  Lead,
-  LeadInput,
-  LeadStatus,
-  ObservedIssue
-} from "./sales-types";
+import type { Lead, LeadInput, LeadStatus } from "./sales-types";
 
 export function outreachIsEnabled(value: string | undefined): boolean {
   return value === "true";
 }
 
 const ALLOWED_TRANSITIONS: Record<LeadStatus, readonly LeadStatus[]> = {
-  discovered: ["qualified", "lost", "do_not_contact"],
+  new: ["analyzing", "qualified", "lost", "do_not_contact"],
+  analyzing: ["new", "qualified", "lost", "do_not_contact"],
+  discovered: ["analyzing", "qualified", "lost", "do_not_contact"],
   qualified: ["draft_ready", "lost", "do_not_contact"],
   draft_ready: ["approved", "lost", "do_not_contact"],
   approved: ["contacted", "draft_ready", "do_not_contact"],
   contacted: ["replied", "lost", "do_not_contact"],
-  replied: ["meeting_requested", "proposal_sent", "lost", "do_not_contact"],
+  replied: [
+    "meeting",
+    "meeting_requested",
+    "proposal_sent",
+    "lost",
+    "do_not_contact"
+  ],
+  meeting: ["proposal_sent", "won", "lost", "do_not_contact"],
   meeting_requested: ["proposal_sent", "won", "lost", "do_not_contact"],
   proposal_sent: ["won", "lost", "do_not_contact"],
   won: ["do_not_contact"],
@@ -48,38 +52,6 @@ export function leadDedupeKey(input: LeadInput): string {
   return `name-city:${input.businessName.trim().toLowerCase()}|${input.city
     .trim()
     .toLowerCase()}`;
-}
-
-export function calculateLeadScore(input: {
-  websiteUrl?: string;
-  publicEmail?: string;
-  category: string;
-  city: string;
-  issues: ObservedIssue[];
-}): { score: number; reasons: string[] } {
-  let score = 20;
-  const reasons = ["20 Basispunkte: passender Hospitality-Betrieb"];
-  if (input.websiteUrl) {
-    score += 10;
-    reasons.push("10 Punkte: öffentliche Website vorhanden");
-  }
-  if (input.publicEmail) {
-    score += 10;
-    reasons.push("10 Punkte: öffentliche geschäftliche E-Mail vorhanden");
-  }
-  const issuePoints = Math.min(
-    50,
-    input.issues.reduce((sum, issue) => sum + Math.max(0, issue.points), 0)
-  );
-  if (issuePoints) {
-    score += issuePoints;
-    reasons.push(`${issuePoints} Punkte: verifizierte Verbesserungsmöglichkeiten`);
-  }
-  if (!input.city.trim()) {
-    score -= 20;
-    reasons.push("-20 Punkte: Ort nicht verifiziert");
-  }
-  return { score: Math.max(0, Math.min(100, score)), reasons };
 }
 
 export function canTransition(from: LeadStatus, to: LeadStatus): boolean {

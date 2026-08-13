@@ -19,13 +19,29 @@ describe("robots policy", () => {
     expect(robotsAllows("User-agent: *\nDisallow: /private", "/menu")).toBe(true);
   });
 
-  it("surfaces Browser Run failures", async () => {
+  it("uses a conservative HTML fallback when Browser Run is unavailable", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(new Response("", { status: 404 }))
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("", { status: 404 }))
+        .mockResolvedValueOnce(
+          new Response(
+            '<html lang="fr"><head><title>Café Test</title></head><body><img src="/hero.jpg"><a href="mailto:hello@example.ma">Contact</a></body></html>',
+            {
+              status: 200,
+              headers: { "content-type": "text/html" }
+            }
+          )
+        )
     );
-    await expect(
-      analyzePublicBusinessWebsite({} as Fetcher, "https://example.ma")
-    ).rejects.toThrow("Browser Run unavailable");
+    const result = await analyzePublicBusinessWebsite(
+      {} as Fetcher,
+      "https://example.ma"
+    );
+    expect(result.title).toBe("Café Test");
+    expect(result.publicEmails).toEqual(["hello@example.ma"]);
+    expect(result.issues.map((issue) => issue.code)).toContain("mobile_viewport");
+    expect(result.issues.map((issue) => issue.code)).toContain("image_alt");
   });
 });

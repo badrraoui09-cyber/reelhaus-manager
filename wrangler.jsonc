@@ -11,6 +11,7 @@
     "ALLOW_LOCAL_BEARER_AUTH": "false",
     "EMAIL_MODE": "mock",
     "OUTREACH_ENABLED": "false",
+    "DISCOVERY_OSM_ENABLED": "true",
     "MAX_DAILY_NEW_LEADS": "20",
     "MAX_DAILY_SENDS": "5",
     "MIN_FOLLOW_UP_DAYS": "7"

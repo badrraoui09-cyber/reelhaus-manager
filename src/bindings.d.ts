@@ -8,5 +8,7 @@ declare namespace Cloudflare {
     GMAIL_CLIENT_ID?: string;
     GMAIL_CLIENT_SECRET?: string;
     GMAIL_REFRESH_TOKEN?: string;
+    DISCOVERY_SOURCE_URLS?: string;
+    DISCOVERY_OSM_ENABLED?: string;
   }
 }

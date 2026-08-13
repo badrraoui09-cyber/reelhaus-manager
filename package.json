@@ -2,7 +2,7 @@
   "name": "reelhaus-manager",
   "version": "1.0.0",
   "private": true,
-  "packageManager": "pnpm@10.15.1",
+  "packageManager": "npm@11.5.2",
   "description": "Controlled Cloudflare Worker website guardian and outreach agent for ReelHaus",
   "keywords": [
     "cloudflare",

@@ -27,6 +27,15 @@ afterEach(() => {
 });
 
 describe("Cloudflare Access authentication", () => {
+  it("does not authenticate an unauthorized protected API request", async () => {
+    const result = await validateCloudflareAccess(
+      requestWithToken(),
+      configured
+    );
+    expect(result.status).toBe("missing_jwt");
+    expect(result).not.toHaveProperty("identity");
+  });
+
   it("distinguishes missing configuration from a missing JWT", async () => {
     await expect(validateCloudflareAccess(requestWithToken(), {})).resolves.toEqual(
       { status: "not_configured" }
