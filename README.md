@@ -217,6 +217,11 @@ npm run build
 npm run dev
 ```
 
+Production deployment must use `npm run deploy`. The Cloudflare Vite plugin
+generates `dist/reelhaus_manager/wrangler.json`, which points Static Assets to
+`dist/client`. Running `wrangler deploy` directly against the source config can
+update Worker code without publishing the newly built dashboard assets.
+
 This is a Cloudflare Vite-plugin project. The input `wrangler.jsonc` deliberately
 does not set `assets.directory`; `vite build` generates the deployment
 configuration and points it at `dist/client`. Always run the Vite build before
