@@ -607,8 +607,9 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   }
 
   // Owner retention decision (between Task #5B.2 and #5B.3): public
-  // ReelScan inquiry records must be deleted no later than
-  // PUBLIC_INTAKE_RETENTION_DAYS after created_at. Runs on the agents SDK's
+  // ReelScan inquiry records become deletion-eligible once they reach
+  // PUBLIC_INTAKE_RETENTION_DAYS old (created_at) and are removed by the
+  // next daily retention cleanup pass. Runs on the agents SDK's
   // own cron scheduling (SQLite-backed, idempotent by callback+cron+
   // payload) rather than a hand-rolled Durable Object alarm() — the same
   // reasoning as scheduleInboundScanQueue() above, and explicitly required:

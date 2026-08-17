@@ -1,10 +1,13 @@
 // Retention cleanup for public ReelScan inbound requests — an owner
-// decision, not an engineering default: opted-in public-intake request
-// records must be deleted no later than PUBLIC_INTAKE_RETENTION_DAYS after
-// the original submission date. If a business later becomes a customer,
-// information genuinely needed for that relationship is handled separately
-// under its own future retention rules — the original public-intake record
-// does not need to remain indefinitely.
+// decision, not an engineering default: an opted-in public-intake request
+// record becomes deletion-eligible once it reaches PUBLIC_INTAKE_RETENTION_
+// DAYS old, and is actually removed by the next daily retention cleanup
+// pass (RETENTION_CLEANUP_CRON in public-intake-config.ts) — not
+// necessarily at the exact instant it turns 90 days old. If a business
+// later becomes a customer, information genuinely needed for that
+// relationship is handled separately under its own future retention rules
+// — the original public-intake record does not need to remain
+// indefinitely.
 //
 // Mirrors the storage-agnostic Store + Service architecture used throughout
 // this codebase (audit-ledger.ts, public-intake-store.ts): all decision
@@ -14,7 +17,9 @@
 // PublicIntakeService.processQueue().
 import type { AuditLedgerService } from "./audit-ledger";
 import {
+  PRE_TURNSTILE_ATTEMPT_LIMIT,
   PUBLIC_INTAKE_RETENTION_DAYS,
+  PUBLIC_RATE_LIMIT,
   RETENTION_CLEANUP_CRON
 } from "./public-intake-config";
 import type { PublicIntakeStore } from "./public-intake-store";
@@ -32,10 +37,13 @@ export function computeRetentionCutoffIso(nowIso: string): string {
 }
 
 /**
- * True once a request's age is >= PUBLIC_INTAKE_RETENTION_DAYS —
- * deliberately inclusive of the exact boundary (a request created exactly
- * 90 days before `now` is expired, not kept for one more day): "no later
- * than 90 days" is satisfied by deleting AT 90 days, not after it.
+ * True once a request's age is >= PUBLIC_INTAKE_RETENTION_DAYS — i.e. it
+ * has become deletion-eligible, deliberately inclusive of the exact
+ * boundary (a request created exactly 90 days before `now` is eligible,
+ * not kept for one more day). Eligibility is instantaneous and exact;
+ * actual deletion is not — it happens whenever the next daily cleanup
+ * pass runs (see RETENTION_CLEANUP_CRON), which this function has no
+ * opinion about.
  */
 export function isRequestExpired(createdAtIso: string, nowIso: string): boolean {
   return Date.parse(createdAtIso) <= Date.parse(computeRetentionCutoffIso(nowIso));
@@ -193,6 +201,11 @@ export class PublicIntakeRetentionService {
    *      events) — never Client #0's or any other unrelated trail, since
    *      this only ever acts on a scanId taken from an expired
    *      inbound_requests row in the first place.
+   *
+   * Also purges stale public_rate_limit_windows rows (both the accepted-
+   * request and pre-Turnstile verification-attempt namespaces) on this
+   * same pass — see the inline comment further down for why a caller who
+   * never gets past Turnstile needs this, not just deleted requests.
    */
   cleanup(nowIso: string, batchLimit: number): RetentionCleanupResult {
     const { store, auditLedger, statusStore } = this.deps;
@@ -222,6 +235,28 @@ export class PublicIntakeRetentionService {
     // cheap "found nothing" pass rather than silently leaving a backlog
     // unprocessed until tomorrow's cron tick.
     const moreRemaining = expired.length === batchLimit;
+
+    // Rate-limit storage hygiene: purge stale public_rate_limit_windows
+    // rows on the SAME daily pass (no separate per-request schedule). The
+    // only other purge call site — PublicIntakeService.submit() — only
+    // runs on an ACCEPTED submission, so a caller who never gets past
+    // Turnstile (or never submits again) would otherwise leave its
+    // pseudonymous caller-key row (both the accepted-request window and
+    // the pre-Turnstile verify-attempt window share this table) sitting
+    // forever. purgeStaleRateLimitWindows() does not distinguish key
+    // namespaces, so one call purges rows from both PUBLIC_RATE_LIMIT's
+    // and PRE_TURNSTILE_ATTEMPT_LIMIT's windows. Math.max guards against
+    // the two ever diverging in the future: using the LARGER window's
+    // cutoff never prematurely purges a row still within the other
+    // window's legitimate lifetime. No raw IP is stored here (the key is
+    // already the pseudonymous, peppered hash from hashCallerKey — see
+    // caller-key.ts) and nothing about a purged key is logged or recorded.
+    const nowSeconds = Math.floor(Date.parse(nowIso) / 1000);
+    const rateLimitWindowSeconds = Math.max(
+      PUBLIC_RATE_LIMIT.windowSeconds,
+      PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds
+    );
+    store.purgeStaleRateLimitWindows(nowSeconds, rateLimitWindowSeconds);
 
     statusStore.recordCleanup(nowIso, deletedRequests, deletedScanTrails);
     return { deletedRequests, deletedScanTrails, moreRemaining };

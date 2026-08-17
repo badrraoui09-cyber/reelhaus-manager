@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { AuditLedgerService, InMemoryAuditLedgerStore } from "./audit-ledger";
-import { PUBLIC_INTAKE_RETENTION_DAYS } from "./public-intake-config";
+import {
+  PRE_TURNSTILE_ATTEMPT_LIMIT,
+  PUBLIC_INTAKE_RETENTION_DAYS,
+  PUBLIC_RATE_LIMIT,
+  VERIFICATION_ATTEMPT_KEY_PREFIX
+} from "./public-intake-config";
 import {
   InMemoryPublicIntakeStore,
   type InboundRequestRecord
@@ -429,5 +434,138 @@ describe("ensureRetentionCleanupSchedule — daily schedule setup", () => {
     // Every call used the exact same cron string — a different string would
     // be treated as a DIFFERENT schedule by the SDK's own dedup key.
     expect(new Set(calls.map((c) => c.when)).size).toBe(1);
+  });
+});
+
+// -- Task #5B.2R-fix: rate-limit storage hygiene on the same daily pass ----
+describe("PublicIntakeRetentionService.cleanup — rate-limit window purge", () => {
+  const nowSeconds = Math.floor(Date.parse(NOW) / 1000);
+
+  function staleWindowStart(windowSeconds: number): number {
+    // purgeStaleRateLimitWindows() only purges rows stale WELL beyond their
+    // own lifetime (windowSeconds * 2) — go comfortably past that so this
+    // isn't sitting right on the boundary.
+    return nowSeconds - windowSeconds * 2 - 10;
+  }
+
+  // 4. stale verification-attempt rate-limit rows are deleted
+  it("purges a stale pre-Turnstile verification-attempt window row", () => {
+    const { store, service } = harness();
+    const key = `${VERIFICATION_ATTEMPT_KEY_PREFIX}caller-probe`;
+    store.touchRateLimitWindow(
+      key,
+      staleWindowStart(PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds),
+      PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds
+    );
+    service.cleanup(NOW, 50);
+    expect(store.getRateLimitWindow(key)).toBeNull();
+  });
+
+  // 5. stale accepted-request rate-limit rows are deleted
+  it("purges a stale accepted-request window row", () => {
+    const { store, service } = harness();
+    const key = "caller-accepted";
+    store.touchRateLimitWindow(
+      key,
+      staleWindowStart(PUBLIC_RATE_LIMIT.windowSeconds),
+      PUBLIC_RATE_LIMIT.windowSeconds
+    );
+    service.cleanup(NOW, 50);
+    expect(store.getRateLimitWindow(key)).toBeNull();
+  });
+
+  // 6. fresh rate-limit windows remain
+  it("leaves a fresh accepted-request window untouched", () => {
+    const { store, service } = harness();
+    const key = "caller-fresh";
+    store.touchRateLimitWindow(key, nowSeconds - 60, PUBLIC_RATE_LIMIT.windowSeconds);
+    service.cleanup(NOW, 50);
+    expect(store.getRateLimitWindow(key)).not.toBeNull();
+  });
+
+  it("leaves a fresh verification-attempt window untouched", () => {
+    const { store, service } = harness();
+    const key = `${VERIFICATION_ATTEMPT_KEY_PREFIX}caller-fresh`;
+    store.touchRateLimitWindow(key, nowSeconds - 60, PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds);
+    service.cleanup(NOW, 50);
+    expect(store.getRateLimitWindow(key)).not.toBeNull();
+  });
+
+  it("purges a stale caller-key row even when the caller never submits again — no valid Turnstile submission required for cleanup to happen", () => {
+    // This is the exact gap this round closes: PublicIntakeService.submit()
+    // only purges as a side effect of an ACCEPTED request, which a prober
+    // that never passes Turnstile will never trigger. The daily retention
+    // pass purges independently of any submission ever occurring.
+    const { store, service } = harness();
+    const key = `${VERIFICATION_ATTEMPT_KEY_PREFIX}never-submits-again`;
+    store.touchRateLimitWindow(
+      key,
+      staleWindowStart(PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds),
+      PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds
+    );
+    // No inbound_requests row inserted at all — nothing "expired" to drive
+    // deletion; this proves the rate-limit purge does not piggyback on
+    // request expiry, it runs unconditionally on every cleanup pass.
+    const result = service.cleanup(NOW, 50);
+    expect(result.deletedRequests).toBe(0);
+    expect(store.getRateLimitWindow(key)).toBeNull();
+  });
+
+  // 7. cleanup remains idempotent (rate-limit purge included)
+  it("rerunning cleanup after a purge is a safe no-op — nothing left to purge, no error", () => {
+    const { store, service } = harness();
+    const key = "caller-accepted";
+    store.touchRateLimitWindow(
+      key,
+      staleWindowStart(PUBLIC_RATE_LIMIT.windowSeconds),
+      PUBLIC_RATE_LIMIT.windowSeconds
+    );
+    service.cleanup(NOW, 50);
+    expect(store.getRateLimitWindow(key)).toBeNull();
+    expect(() => service.cleanup(NOW, 50)).not.toThrow();
+    expect(store.getRateLimitWindow(key)).toBeNull();
+  });
+
+  // 8. no AI/fetch/outreach is triggered by the rate-limit purge either
+  it("purging rate-limit windows makes zero network calls", () => {
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls++;
+      throw new Error("retention cleanup must never fetch");
+    }) as typeof fetch;
+    try {
+      const { store, service } = harness();
+      store.touchRateLimitWindow(
+        `${VERIFICATION_ATTEMPT_KEY_PREFIX}caller-probe`,
+        staleWindowStart(PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds),
+        PRE_TURNSTILE_ATTEMPT_LIMIT.windowSeconds
+      );
+      store.touchRateLimitWindow(
+        "caller-accepted",
+        staleWindowStart(PUBLIC_RATE_LIMIT.windowSeconds),
+        PUBLIC_RATE_LIMIT.windowSeconds
+      );
+      expect(() => service.cleanup(NOW, 50)).not.toThrow();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("purging never stores or requires a raw IP — the key is opaque to purgeStaleRateLimitWindows regardless of format", () => {
+    // Not a behavior change in this round (caller keys were already the
+    // peppered hash from hashCallerKey — see caller-key.ts), but pinned
+    // here so the retention module never grows an IP-shaped dependency:
+    // the purge call only needs (nowSeconds, windowSeconds), never a key.
+    const { store, service } = harness();
+    const opaqueKey = "9f3a2b7c1d0e4f6a8b5c3d2e1f0a9b8c";
+    store.touchRateLimitWindow(
+      opaqueKey,
+      staleWindowStart(PUBLIC_RATE_LIMIT.windowSeconds),
+      PUBLIC_RATE_LIMIT.windowSeconds
+    );
+    service.cleanup(NOW, 50);
+    expect(store.getRateLimitWindow(opaqueKey)).toBeNull();
   });
 });

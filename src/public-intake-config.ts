@@ -134,10 +134,13 @@ export const QUEUE_RETRY_DELAY_SECONDS = 30;
 
 // -- Public intake retention (owner decision, see public-intake-retention.ts) --
 //
-// Public ReelScan inquiry records must be deleted no later than 90 days
-// after the original submission date (created_at, never updated_at — an
-// internal scan/status change must not silently extend retention). If a
-// business later becomes a customer, information genuinely needed for that
+// Public ReelScan inquiry records become deletion-eligible once they reach
+// PUBLIC_INTAKE_RETENTION_DAYS old (created_at, never updated_at — an
+// internal scan/status change must not silently extend retention), and are
+// actually removed by the next daily retention cleanup pass — not
+// necessarily at the instant they turn 90 days old (see
+// RETENTION_CLEANUP_CRON below for the cleanup cadence). If a business
+// later becomes a customer, information genuinely needed for that
 // relationship is handled separately under its own future retention rules;
 // the original public-intake record does not need to remain indefinitely.
 export const PUBLIC_INTAKE_RETENTION_DAYS = 90;
