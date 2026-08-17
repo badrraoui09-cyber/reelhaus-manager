@@ -6,6 +6,8 @@ import {
   type WorkersAiBinding
 } from "./ai-service";
 
+const REELSCAN_TEST_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+
 function fakeAi(run: WorkersAiBinding["run"]): WorkersAiBinding {
   return { run };
 }
@@ -68,6 +70,62 @@ describe("WorkersAiService", () => {
     await expect(new WorkersAiService(ai).runTextPrompt("hello")).rejects.toThrow(
       "Unexpected Workers AI response shape"
     );
+  });
+
+  it("rejects a structured object response on the text path instead of coercing it", async () => {
+    // This is exactly the real Client #0 failure: Workers AI's JSON Mode can
+    // return `.response` as an object. The text path must still reject it,
+    // not silently stringify/coerce it.
+    const ai = fakeAi(async () => ({ response: { findings: [] } }));
+    await expect(
+      new WorkersAiService(ai, REELSCAN_TEST_MODEL).runChatPrompt([
+        { role: "user", content: "hi" }
+      ])
+    ).rejects.toThrow("Unexpected Workers AI response shape");
+  });
+});
+
+describe("WorkersAiService.runStructuredPrompt", () => {
+  it("accepts a structured object response (Workers AI JSON Schema mode)", async () => {
+    const ai = fakeAi(async () => ({ response: { findings: [] } }));
+    const result = await new WorkersAiService(
+      ai,
+      REELSCAN_TEST_MODEL
+    ).runStructuredPrompt([{ role: "user", content: "hi" }]);
+    expect(result.response).toEqual({ findings: [] });
+  });
+
+  it("accepts a JSON string response without stringifying/reparsing an object", async () => {
+    const ai = fakeAi(async () => ({ response: '{"findings":[]}' }));
+    const result = await new WorkersAiService(
+      ai,
+      REELSCAN_TEST_MODEL
+    ).runStructuredPrompt([{ role: "user", content: "hi" }]);
+    expect(result.response).toBe('{"findings":[]}');
+  });
+
+  it("sends the requested json_schema response_format", async () => {
+    const schema = { type: "object", properties: {}, required: [] };
+    const ai = fakeAi(async (_model, inputs) => {
+      expect(inputs.response_format).toEqual({
+        type: "json_schema",
+        json_schema: schema
+      });
+      return { response: { findings: [] } };
+    });
+    await new WorkersAiService(ai, REELSCAN_TEST_MODEL).runStructuredPrompt(
+      [{ role: "user", content: "hi" }],
+      { responseFormat: { type: "json_schema", json_schema: schema } }
+    );
+  });
+
+  it("still rejects a genuinely unexpected response shape", async () => {
+    const ai = fakeAi(async () => ({ unexpected: true }));
+    await expect(
+      new WorkersAiService(ai, REELSCAN_TEST_MODEL).runStructuredPrompt([
+        { role: "user", content: "hi" }
+      ])
+    ).rejects.toThrow("Unexpected Workers AI response shape");
   });
 });
 

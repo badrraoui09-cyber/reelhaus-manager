@@ -44,6 +44,12 @@ export interface AiTextPromptResult {
   response: string;
 }
 
+export interface AiStructuredPromptResult {
+  model: string;
+  /** Whatever the model returned: a JSON string, or an already-parsed object/array. */
+  response: unknown;
+}
+
 export interface AiHealthResult {
   ok: boolean;
   provider: "cloudflare-workers-ai";
@@ -56,6 +62,9 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
 
+// Task #1's text path — unchanged. Requires `.response` to be a string and
+// rejects anything else, including a structured object, rather than
+// silently coercing it.
 function normalizeAiTextOutput(output: unknown): string {
   if (typeof output === "string") return output.trim();
   if (
@@ -68,29 +77,52 @@ function normalizeAiTextOutput(output: unknown): string {
   throw new Error("Unexpected Workers AI response shape");
 }
 
+// Structured (JSON Mode) path — Workers AI can return `.response` as either
+// a JSON string or an already-parsed object/array, depending on the model
+// and response_format. Extracted as-is; never stringified-and-reparsed.
+function normalizeAiStructuredOutput(output: unknown): unknown {
+  if (typeof output === "string") return output;
+  if (output && typeof output === "object" && "response" in output) {
+    const response = (output as { response: unknown }).response;
+    if (
+      typeof response === "string" ||
+      (response !== null && typeof response === "object")
+    )
+      return response;
+  }
+  throw new Error("Unexpected Workers AI response shape");
+}
+
 export class WorkersAiService {
   constructor(
     private readonly ai: WorkersAiBinding | undefined,
     private readonly model: string = AI_TEXT_MODEL
   ) {}
 
-  private async execute(
+  private async run(
     inputs: Record<string, unknown>,
     timeoutMs: number
-  ): Promise<AiTextPromptResult> {
+  ): Promise<unknown> {
     if (!this.ai) throw new Error("Workers AI binding is not configured");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const output = await this.ai.run(this.model, inputs, {
+      return await this.ai.run(this.model, inputs, {
         signal: controller.signal
       });
-      return { model: this.model, response: normalizeAiTextOutput(output) };
     } catch (error) {
       throw new Error(`Workers AI request failed: ${errorMessage(error)}`);
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private async execute(
+    inputs: Record<string, unknown>,
+    timeoutMs: number
+  ): Promise<AiTextPromptResult> {
+    const output = await this.run(inputs, timeoutMs);
+    return { model: this.model, response: normalizeAiTextOutput(output) };
   }
 
   async runTextPrompt(
@@ -114,6 +146,29 @@ export class WorkersAiService {
       },
       timeoutMs
     );
+  }
+
+  /**
+   * For callers that requested structured/JSON-mode output and need the
+   * raw parsed value (string or object) rather than a coerced string.
+   * Callers remain responsible for validating the shape themselves —
+   * provider-side JSON Schema is best-effort, not a guarantee.
+   */
+  async runStructuredPrompt(
+    messages: AiChatMessage[],
+    options: AiChatOptions = {},
+    timeoutMs = DEFAULT_TIMEOUT_MS
+  ): Promise<AiStructuredPromptResult> {
+    const output = await this.run(
+      {
+        messages,
+        temperature: options.temperature,
+        max_tokens: options.maxTokens,
+        response_format: options.responseFormat
+      },
+      timeoutMs
+    );
+    return { model: this.model, response: normalizeAiStructuredOutput(output) };
   }
 }
 

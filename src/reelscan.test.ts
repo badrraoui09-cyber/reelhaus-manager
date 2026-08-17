@@ -3,6 +3,7 @@ import { WorkersAiService, type WorkersAiBinding } from "./ai-service";
 import { AuditLedgerService, InMemoryAuditLedgerStore } from "./audit-ledger";
 import {
   REELSCAN_AI_TIMEOUT_MS,
+  REELSCAN_JSON_SCHEMA,
   REELSCAN_MODEL,
   ReelScanValidationError,
   buildReelScanPrompt,
@@ -81,8 +82,8 @@ function fakeAi(run: WorkersAiBinding["run"]): WorkersAiBinding {
   return { run };
 }
 
-function validAiJson(evidenceIds: string[]): string {
-  return JSON.stringify({
+function validAiPayload(evidenceIds: string[]) {
+  return {
     findings: [
       {
         title: "No booking/reservation CTA above the fold",
@@ -106,7 +107,18 @@ function validAiJson(evidenceIds: string[]): string {
         kind: "strength"
       }
     ]
-  });
+  };
+}
+
+// Workers AI can return `.response` as a JSON string...
+function validAiJson(evidenceIds: string[]): string {
+  return JSON.stringify(validAiPayload(evidenceIds));
+}
+
+// ...or, under JSON Schema mode, as an already-parsed object — the real
+// Client #0 failure this fix addresses.
+function validAiObject(evidenceIds: string[]) {
+  return validAiPayload(evidenceIds);
 }
 
 function fakeReport(): AuditReport {
@@ -218,6 +230,42 @@ describe("AI output validation", () => {
     expect(validated).toHaveLength(2);
     expect(validated[0].kind).toBe("issue");
     expect(validated[1].kind).toBe("strength");
+  });
+
+  it("accepts an already-parsed object response (Workers AI JSON Schema mode)", () => {
+    const validated = parseReelScanAiResponse(
+      validAiObject(["ev-1", "ev-2"]),
+      new Set(["ev-1", "ev-2"])
+    );
+    expect(validated).toHaveLength(2);
+    expect(validated[0].kind).toBe("issue");
+    expect(validated[1].kind).toBe("strength");
+  });
+
+  it("rejects a malformed object response the same way as malformed JSON", () => {
+    expect(() =>
+      parseReelScanAiResponse({ ok: true }, new Set(["ev-1"]))
+    ).toThrow(ReelScanValidationError);
+  });
+
+  it("rejects an object response citing a fake evidence ID", () => {
+    const payload = {
+      findings: [
+        {
+          title: "x",
+          category: "technical",
+          severity: "optional",
+          priority: 3,
+          summary: "x",
+          evidenceIds: ["ev-invented"],
+          confidence: 0.5,
+          kind: "issue"
+        }
+      ]
+    };
+    expect(() =>
+      parseReelScanAiResponse(payload, new Set(["ev-1"]))
+    ).toThrow(ReelScanValidationError);
   });
 
   it("rejects malformed JSON", () => {
@@ -338,6 +386,49 @@ describe("runReelScanV1ClientZero orchestration", () => {
     const trail = ledger.getScanAuditTrail(result.scanId);
     expect(trail.evidence.length).toBe(result.evidence.length);
     expect(trail.findings.length).toBe(2);
+  });
+
+  it("completes successfully when Workers AI returns an already-parsed structured object — the real Client #0 regression", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async (_model, inputs) => {
+      const evidence = (
+        JSON.parse(
+          (inputs.messages as Array<{ content: string }>)[1].content.match(
+            /Evidence.*:\n(\[.*\])\n\n/s
+          )![1]
+        ) as Array<{ id: string }>
+      ).map((item) => item.id);
+      // Workers AI JSON Schema mode: `.response` is an object, not a string.
+      return { response: validAiObject(evidence) };
+    });
+
+    const { result } = await runReelScanV1ClientZero({
+      ai,
+      auditLedger: ledger,
+      fetcher: fakeGuardianFetcher()
+    });
+
+    expect(result.analysisRun.status).toBe("completed");
+    expect(result.findings.length).toBe(2);
+    expect(result.reviewStatus).toBe("needs_review");
+    expect(result.recommendation).not.toBeNull();
+  });
+
+  it("requests Cloudflare's json_schema response_format with the ReelScan schema", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async (_model, inputs) => {
+      expect(inputs.response_format).toEqual({
+        type: "json_schema",
+        json_schema: REELSCAN_JSON_SCHEMA
+      });
+      return { response: { findings: [] } };
+    });
+
+    await runReelScanV1ClientZero({
+      ai,
+      auditLedger: ledger,
+      fetcher: fakeGuardianFetcher()
+    });
   });
 
   it("marks the analysis run failed and persists no findings when AI output is invalid", async () => {

@@ -51,6 +51,45 @@ const REELSCAN_SEVERITIES: readonly Severity[] = [
 ];
 const REELSCAN_KINDS: readonly FindingKind[] = ["strength", "issue"];
 
+// Cloudflare's JSON Schema mode (response_format: { type: "json_schema" }).
+// Best-effort — the provider notes this cannot guarantee compliance, so
+// parseReelScanAiResponse() re-validates every field independently.
+export const REELSCAN_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          category: { type: "string", enum: [...REELSCAN_CATEGORIES] },
+          severity: { type: "string", enum: [...REELSCAN_SEVERITIES] },
+          priority: { type: "integer", minimum: 1, maximum: 5 },
+          summary: { type: "string" },
+          evidenceIds: {
+            type: "array",
+            items: { type: "string" },
+            minItems: 1
+          },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          kind: { type: "string", enum: [...REELSCAN_KINDS] }
+        },
+        required: [
+          "title",
+          "category",
+          "severity",
+          "priority",
+          "summary",
+          "evidenceIds",
+          "kind"
+        ]
+      }
+    }
+  },
+  required: ["findings"]
+} as const;
+
 export type ReelScanRecommendedAction =
   | "no_immediate_change"
   | "ReelFix"
@@ -335,15 +374,23 @@ Include both "issue" findings (supported problems) and "strength" findings (supp
   ];
 }
 
+// Accepts either a raw JSON string or an already-parsed object/array —
+// Workers AI's structured mode can return `.response` as either, depending
+// on the model. Provider-side JSON Schema is best-effort only, so every
+// field is still validated here regardless of which shape arrived.
 export function parseReelScanAiResponse(
-  raw: string,
+  raw: unknown,
   allowedEvidenceIds: ReadonlySet<string>
 ): ValidatedReelScanFinding[] {
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new ReelScanValidationError("AI response was not valid JSON");
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new ReelScanValidationError("AI response was not valid JSON");
+    }
+  } else {
+    parsed = raw;
   }
   if (
     !parsed ||
@@ -573,12 +620,15 @@ export async function runReelScanV1ClientZero(
   let findings: FindingRecord[] = [];
   try {
     const service = new WorkersAiService(deps.ai, REELSCAN_MODEL);
-    const response = await service.runChatPrompt(
+    const response = await service.runStructuredPrompt(
       buildReelScanPrompt(evidence),
       {
         temperature: 0,
         maxTokens: 2000,
-        responseFormat: { type: "json_object" }
+        responseFormat: {
+          type: "json_schema",
+          json_schema: REELSCAN_JSON_SCHEMA
+        }
       },
       REELSCAN_AI_TIMEOUT_MS
     );
