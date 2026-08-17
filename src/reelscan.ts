@@ -25,10 +25,13 @@ import { analyzeReelHaus, type AuditReport, type Severity } from "./website-anal
 
 // Centralized so the model/version can change later without touching the
 // pipeline that calls it.
-export const REELSCAN_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8";
+export const REELSCAN_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 export const REELSCAN_PROMPT_VERSION = "reelscan-v1";
 export const REELSCAN_SCHEMA_VERSION = "reelscan-findings-v1";
-export const REELSCAN_AI_TIMEOUT_MS = 30_000;
+// A real inference over ~20+ evidence records regularly exceeds the
+// ai-service.ts default (10s, tuned for the tiny Task #1 health check).
+// Dedicated to ReelScan only — passed explicitly into runChatPrompt().
+export const REELSCAN_AI_TIMEOUT_MS = 60_000;
 
 export const REELSCAN_CATEGORIES = [
   "positioning",
@@ -533,8 +536,8 @@ export interface ReelScanV1Result {
   analysisRun: AiAnalysisRun;
   findings: FindingRecord[];
   score: ReelScanScore | null;
-  recommendation: ReelScanRecommendation;
-  reviewStatus: "needs_review";
+  recommendation: ReelScanRecommendation | null;
+  reviewStatus: "needs_review" | "analysis_failed";
 }
 
 export interface ReelScanV1Deps {
@@ -613,11 +616,8 @@ export async function runReelScanV1ClientZero(
         analysisRun: deps.auditLedger.getScanAuditTrail(scanId).analysisRuns.at(-1)!,
         findings: [],
         score: null,
-        recommendation: {
-          action: "no_immediate_change",
-          reasons: ["AI analysis failed; no validated findings are available."]
-        },
-        reviewStatus: "needs_review"
+        recommendation: null,
+        reviewStatus: "analysis_failed"
       }
     };
   }

@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
-import type { WorkersAiBinding } from "./ai-service";
+import { describe, expect, it, vi } from "vitest";
+import { WorkersAiService, type WorkersAiBinding } from "./ai-service";
 import { AuditLedgerService, InMemoryAuditLedgerStore } from "./audit-ledger";
 import {
+  REELSCAN_AI_TIMEOUT_MS,
+  REELSCAN_MODEL,
   ReelScanValidationError,
   buildReelScanPrompt,
   calculateReelScanScore,
@@ -351,10 +353,81 @@ describe("runReelScanV1ClientZero orchestration", () => {
     expect(result.analysisRun.status).toBe("failed");
     expect(result.findings).toHaveLength(0);
     expect(result.score).toBeNull();
-    expect(result.recommendation.action).toBe("no_immediate_change");
+    // A failed AI analysis must never look like a real "nothing to report"
+    // scan — no recommendation at all, not even the "safe-looking" one.
+    expect(result.recommendation).toBeNull();
+    expect(result.reviewStatus).toBe("analysis_failed");
 
     const trail = ledger.getScanAuditTrail(result.scanId);
     expect(trail.findings).toHaveLength(0);
+    expect(trail.analysisRuns.at(-1)?.status).toBe("failed");
+  });
+
+  it("marks the analysis run failed (not a success) when the AI call itself throws, e.g. an abort", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async () => {
+      throw new Error("The operation was aborted");
+    });
+
+    const { result } = await runReelScanV1ClientZero({
+      ai,
+      auditLedger: ledger,
+      fetcher: fakeGuardianFetcher()
+    });
+
+    expect(result.analysisRun.status).toBe("failed");
+    expect(result.analysisRun.error).toContain("aborted");
+    expect(result.score).toBeNull();
+    expect(result.recommendation).toBeNull();
+    expect(result.reviewStatus).toBe("analysis_failed");
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it("a genuinely successful run with zero AI-found issues still legitimately reports no_immediate_change", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async () => ({ response: JSON.stringify({ findings: [] }) }));
+
+    const { result } = await runReelScanV1ClientZero({
+      ai,
+      auditLedger: ledger,
+      fetcher: fakeGuardianFetcher()
+    });
+
+    expect(result.analysisRun.status).toBe("completed");
+    expect(result.findings).toHaveLength(0);
+    expect(result.score?.score).toBe(100);
+    expect(result.recommendation?.action).toBe("no_immediate_change");
+    expect(result.reviewStatus).toBe("needs_review");
+  });
+
+  it("uses ReelScan's own dedicated ~60s timeout for the AI call, not ai-service's short default", async () => {
+    vi.useFakeTimers();
+    try {
+      let capturedSignal: AbortSignal | undefined;
+      const ai = fakeAi((_model, _inputs, options) => {
+        capturedSignal = options?.signal;
+        // Mirrors real Workers AI: an aborted signal rejects the call.
+        return new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () =>
+            reject(new Error("The operation was aborted"))
+          );
+        });
+      });
+      const service = new WorkersAiService(ai, REELSCAN_MODEL);
+      const callPromise = service
+        .runChatPrompt(buildReelScanPrompt([]), {}, REELSCAN_AI_TIMEOUT_MS)
+        .catch(() => undefined);
+
+      await vi.advanceTimersByTimeAsync(REELSCAN_AI_TIMEOUT_MS - 1000);
+      expect(capturedSignal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(capturedSignal?.aborted).toBe(true);
+
+      await callPromise;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

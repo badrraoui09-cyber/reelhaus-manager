@@ -2941,11 +2941,11 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
         evidenceCount: result.evidence.length,
         findingCount: result.findings.length,
         analysisRunStatus: result.analysisRun.status,
-        recommendedAction: result.recommendation.action,
+        recommendedAction: result.recommendation?.action ?? null,
         reviewStatus: result.reviewStatus
       }
     );
-    return json(result, 201);
+    return json(result, result.analysisRun.status === "failed" ? 503 : 201);
   }
 
   private listReports() {
