@@ -476,6 +476,10 @@ textarea {
   color: #87520b;
   background: #fff0d2;
 }
+.inbound-status.queued_for_scan {
+  color: #2c5876;
+  background: #e3f1fb;
+}
 .inbound-status.scanning {
   color: #87520b;
   background: #fff0d2;

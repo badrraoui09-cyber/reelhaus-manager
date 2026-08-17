@@ -377,7 +377,8 @@ export function technicalEvidenceFromGuardianReport(
       // not be checked at all. Neither is proof of a defect on its own —
       // see downgradeUncertainIssues().
       verification: finding.evidence,
-      reportId: report.id
+      reportId: report.id,
+      rootFindingKey: finding.rootKey
     }
   }));
 }
@@ -616,26 +617,49 @@ export function downgradeUncertainIssues(
 // Problems 2 & 5: one root problem must not deduct score multiple times
 // merely because it was phrased under several categories, or because the
 // same structural signal exists once per language page. Findings of the
-// same kind whose evidence maps to the exact same set of evidence
-// "observationType"s (locale-independent — e.g. FR and AR responsive
-// evidence both have observationType "responsive") are merged into one,
-// keeping every original evidence ID for lineage.
+// same kind that map to the exact same set of evidence ROOT keys are
+// merged into one, keeping every original evidence ID for lineage.
+//
+// Task #5A-fix §3 correction: this used to key on evidence
+// "observationType" alone (a broad category like "forms" or
+// "accessibility"). That conflated genuinely DISTINCT defects that happen
+// to share a category — e.g. "Form has unlabeled fields" and "Form has
+// fields without a name" are both observationType "forms" but are two
+// unrelated root problems, and were silently merging into one finding,
+// discarding the distinction and its separate score impact. Deterministic
+// evidence (website-analysis.ts / generic-website-checks.ts) now stamps a
+// specific, stable `rootFindingKey` per check type onto every evidence
+// record's metadata (e.g. "forms:unlabeled-controls:form-1" vs
+// "forms:unnamed-controls:form-1") — deliberately locale-independent, so
+// the exact same defect appearing on both the FR and AR page still
+// consolidates into one finding, the behavior this whole mechanism exists
+// to provide. Content-evidence records (page_title, hero_text_excerpt,
+// action_link_signals, ...) have no rootFindingKey — their
+// observationType is already a specific-enough identifier (never a broad
+// shared category), so it's used as the fallback key unchanged from
+// before.
 const SEVERITY_RANK: Record<Severity, number> = {
   critical: 3,
   important: 2,
   optional: 1
 };
 
-function evidenceTypeSetKey(
+function evidenceRootKey(evidence: EvidenceRecord | undefined): string {
+  if (!evidence) return "unknown";
+  const rootFindingKey = evidence.metadata?.rootFindingKey;
+  return typeof rootFindingKey === "string" && rootFindingKey
+    ? rootFindingKey
+    : evidence.observationType;
+}
+
+function evidenceRootKeySetKey(
   finding: ValidatedReelScanFinding,
   evidenceById: ReadonlyMap<string, EvidenceRecord>
 ): string {
-  const types = new Set(
-    finding.evidenceIds.map(
-      (id) => evidenceById.get(id)?.observationType || "unknown"
-    )
+  const keys = new Set(
+    finding.evidenceIds.map((id) => evidenceRootKey(evidenceById.get(id)))
   );
-  return [...types].sort().join("+");
+  return [...keys].sort().join("+");
 }
 
 function pickRepresentative(
@@ -654,7 +678,7 @@ export function consolidateFindings(
 ): ValidatedReelScanFinding[] {
   const groups = new Map<string, ValidatedReelScanFinding[]>();
   for (const finding of findings) {
-    const key = `${finding.kind}::${evidenceTypeSetKey(finding, evidenceById)}`;
+    const key = `${finding.kind}::${evidenceRootKeySetKey(finding, evidenceById)}`;
     const group = groups.get(key);
     if (group) group.push(finding);
     else groups.set(key, [finding]);

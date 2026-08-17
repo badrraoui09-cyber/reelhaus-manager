@@ -50,9 +50,10 @@ function finding(
   page: string,
   title: string,
   detail: string,
+  rootKey: string,
   evidence: EvidenceType = "verified"
 ): Finding {
-  return { severity, category, page, title, detail, evidence };
+  return { severity, category, page, title, detail, rootKey, evidence };
 }
 
 function collectMetaMap(html: string): Map<string, string> {
@@ -88,6 +89,13 @@ function collectImages(html: string): Array<{ hasAlt: boolean }> {
   }));
 }
 
+// Conservative, deterministic accessible-name check — NOT a full browser
+// accessible-name computation. An element is only treated as "unnamed"
+// when none of the common safe signals are present: visible text,
+// aria-label, aria-labelledby (presence only — the referenced element's
+// text is not resolved, so this deliberately errs toward "has a name"),
+// or a descendant <img alt="..."> supplying the name (e.g. an icon-only
+// link/button). See Task #5A-fix §1/§2.
 function collectAccessibleNamed(
   html: string,
   tag: "a" | "button"
@@ -97,7 +105,14 @@ function collectAccessibleNamed(
     const [, attrs, inner] = match;
     const hasText = Boolean(stripTags(inner));
     const hasAriaLabel = Boolean(attr(attrs, "aria-label"));
-    return { hasAccessibleName: hasText || hasAriaLabel };
+    const hasAriaLabelledBy = Boolean(attr(attrs, "aria-labelledby"));
+    const hasNamedDescendantImg = [...inner.matchAll(/<img\b[^>]*>/gi)].some(
+      (imgMatch) => Boolean((attr(imgMatch[0], "alt") || "").trim())
+    );
+    return {
+      hasAccessibleName:
+        hasText || hasAriaLabel || hasAriaLabelledBy || hasNamedDescendantImg
+    };
   });
 }
 
@@ -106,6 +121,9 @@ interface GenericFormControl {
   name: string | null;
   type: string;
   ariaLabel: string | null;
+  ariaLabelledBy: string | null;
+  /** Implicit label association: the control is a descendant of a <label>. */
+  hasWrappingLabel: boolean;
 }
 
 interface GenericForm {
@@ -130,16 +148,31 @@ function collectForms(html: string): GenericForm[] {
     /<form\b([^>]*)>([\s\S]*?)<\/form>/gi
   )) {
     const [, formAttrs, inner] = formMatch;
+    // Implicit label association: a control is "wrapped" when its match
+    // position falls inside a <label>...</label> span within this form.
+    // Labels don't nest in valid HTML, so non-overlapping spans suffice.
+    const labelSpans: Array<[number, number]> = [
+      ...inner.matchAll(/<label\b[^>]*>[\s\S]*?<\/label>/gi)
+    ].map((labelMatch) => {
+      const start = labelMatch.index ?? 0;
+      return [start, start + labelMatch[0].length] as [number, number];
+    });
     const controls: GenericFormControl[] = [];
     for (const controlMatch of inner.matchAll(
       /<(input|select|textarea)\b([^>]*)\/?>/gi
     )) {
       const [, tagName, controlAttrs] = controlMatch;
+      const controlIndex = controlMatch.index ?? 0;
+      const hasWrappingLabel = labelSpans.some(
+        ([start, end]) => controlIndex >= start && controlIndex < end
+      );
       controls.push({
         id: attr(controlAttrs, "id"),
         name: attr(controlAttrs, "name"),
         type: (attr(controlAttrs, "type") || tagName).toLowerCase(),
-        ariaLabel: attr(controlAttrs, "aria-label")
+        ariaLabel: attr(controlAttrs, "aria-label"),
+        ariaLabelledBy: attr(controlAttrs, "aria-labelledby"),
+        hasWrappingLabel
       });
     }
     forms.push({ method: attr(formAttrs, "method"), controls });
@@ -166,7 +199,14 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
 
   if (!title) {
     issues.push(
-      finding("important", "metadata", pageUrl, "Page title missing", "No <title> element was found.")
+      finding(
+        "important",
+        "metadata",
+        pageUrl,
+        "Page title missing",
+        "No <title> element was found.",
+        "metadata:missing-title"
+      )
     );
   } else if (title.length < 15 || title.length > 65) {
     issues.push(
@@ -175,13 +215,21 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "seo",
         pageUrl,
         "Check page title length",
-        `The title is ${title.length} characters; a typical range is about 15-65.`
+        `The title is ${title.length} characters; a typical range is about 15-65.`,
+        "seo:title-length"
       )
     );
   }
   if (!description) {
     issues.push(
-      finding("important", "metadata", pageUrl, "Meta description missing", "No meta description was found.")
+      finding(
+        "important",
+        "metadata",
+        pageUrl,
+        "Meta description missing",
+        "No meta description was found.",
+        "metadata:missing-description"
+      )
     );
   } else if (description.length < 70 || description.length > 170) {
     issues.push(
@@ -190,13 +238,21 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "seo",
         pageUrl,
         "Check meta description length",
-        `The description is ${description.length} characters; a typical range is about 70-170.`
+        `The description is ${description.length} characters; a typical range is about 70-170.`,
+        "seo:description-length"
       )
     );
   }
   if (!canonical) {
     issues.push(
-      finding("important", "seo", pageUrl, "Canonical URL missing", "No rel=canonical link was found.")
+      finding(
+        "important",
+        "seo",
+        pageUrl,
+        "Canonical URL missing",
+        "No rel=canonical link was found.",
+        "seo:missing-canonical"
+      )
     );
   }
   if (!viewport.toLowerCase().includes("width=device-width")) {
@@ -206,7 +262,8 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "responsive",
         pageUrl,
         "Mobile viewport missing",
-        'No meta viewport with "width=device-width" was found.'
+        'No meta viewport with "width=device-width" was found.',
+        "responsive:missing-viewport"
       )
     );
   }
@@ -217,6 +274,7 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
       pageUrl,
       "Manually verify visual responsive layout",
       "This collector analyzes HTML without rendering a browser viewport, so overflow, touch targets, and breakpoints are not visually verified.",
+      "responsive:manual-check-note",
       "inference"
     )
   );
@@ -229,7 +287,8 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "accessibility",
         pageUrl,
         "Check H1 structure",
-        `Found ${h1Count} <h1> heading(s); a single clear main heading is expected.`
+        `Found ${h1Count} <h1> heading(s); a single clear main heading is expected.`,
+        "accessibility:h1-structure"
       )
     );
   }
@@ -243,7 +302,8 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "accessibility",
         pageUrl,
         "Images without an alt attribute",
-        `${missingAlts.length} of ${images.length} image(s) have no alt attribute.`
+        `${missingAlts.length} of ${images.length} image(s) have no alt attribute.`,
+        "accessibility:missing-alt"
       )
     );
   }
@@ -257,7 +317,8 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "accessibility",
         pageUrl,
         "Links without an accessible name",
-        `${unnamedLinks.length} link(s) have neither visible text nor an aria-label.`
+        `${unnamedLinks.length} link(s) have neither visible text, an aria-label/aria-labelledby, nor a labeled image.`,
+        "accessibility:unnamed-links"
       )
     );
   }
@@ -271,17 +332,23 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "accessibility",
         pageUrl,
         "Buttons without an accessible name",
-        `${unnamedButtons.length} button(s) have neither visible text nor an aria-label.`
+        `${unnamedButtons.length} button(s) have neither visible text, an aria-label/aria-labelledby, nor a labeled image.`,
+        "accessibility:unnamed-buttons"
       )
     );
   }
 
   const forms = collectForms(html);
   for (const [index, form] of forms.entries()) {
+    // A control is unlabeled only when none of the recognized association
+    // methods apply: explicit label[for], implicit wrapping <label>,
+    // aria-label, or aria-labelledby (presence only). See Task #5A-fix §1.
     const unlabeled = form.controls.filter(
       (control) =>
         control.type !== "hidden" &&
         !control.ariaLabel &&
+        !control.ariaLabelledBy &&
+        !control.hasWrappingLabel &&
         (!control.id || !labelFors.has(control.id))
     );
     const unnamed = form.controls.filter(
@@ -294,7 +361,8 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
           "forms",
           pageUrl,
           `Form ${index + 1} has unlabeled fields`,
-          `${unlabeled.length} form control(s) have no recognizable label.`
+          `${unlabeled.length} form control(s) have no recognizable label.`,
+          `forms:unlabeled-controls:form-${index + 1}`
         )
       );
     }
@@ -305,7 +373,8 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
           "forms",
           pageUrl,
           `Form ${index + 1} has fields without a name`,
-          `${unnamed.length} form control(s) cannot be submitted normally without a name attribute.`
+          `${unnamed.length} form control(s) cannot be submitted normally without a name attribute.`,
+          `forms:unnamed-controls:form-${index + 1}`
         )
       );
     }
@@ -317,6 +386,7 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
           pageUrl,
           `Form ${index + 1} uses GET or no method`,
           "For personal or longer input, verify the intended HTTP method.",
+          `forms:get-method-note:form-${index + 1}`,
           "inference"
         )
       );
@@ -330,7 +400,8 @@ export function genericHtmlChecks(pageUrl: string, html: string): Finding[] {
         "seo",
         pageUrl,
         "Open Graph metadata incomplete",
-        "og:title and/or og:description are missing."
+        "og:title and/or og:description are missing.",
+        "seo:missing-og-metadata"
       )
     );
   }
@@ -360,7 +431,8 @@ export function technicalEvidenceFromGenericFindings(
     collector: GENERIC_CHECKS_COLLECTOR,
     metadata: {
       severity: item.severity,
-      verification: item.evidence
+      verification: item.evidence,
+      rootFindingKey: item.rootKey
     }
   }));
 }

@@ -80,6 +80,62 @@ describe("genericHtmlChecks", () => {
     );
   });
 
+  // Task #5A-fix §1/§2/§10: the same label/accessible-name false-positive
+  // fix applied to Website Guardian, mirrored here for the generic
+  // customer-target checker (which uses regex, not HTMLRewriter, but must
+  // recognize the same set of association methods).
+  it("does NOT flag a control implicitly labeled by a wrapping <label>", () => {
+    const html = `<html><head><title>x-page-title-long-enough</title><meta name="viewport" content="width=device-width"><meta name="description" content="a description that is long enough to pass the seventy character minimum length check easily"><link rel="canonical" href="https://x.example/"></head><body><h1>x</h1>
+      <form><label>Email<input name="email"></label></form>
+    </body></html>`;
+    const findings = genericHtmlChecks("https://x.example/", html);
+    expect(findings.some((f) => f.category === "forms" && f.title.includes("unlabeled"))).toBe(
+      false
+    );
+  });
+
+  it("recognizes aria-label as a valid association", () => {
+    const html = `<html><head><title>x-page-title-long-enough</title><meta name="viewport" content="width=device-width"><meta name="description" content="a description that is long enough to pass the seventy character minimum length check easily"><link rel="canonical" href="https://x.example/"></head><body><h1>x</h1>
+      <form><input name="email" aria-label="Email"></form>
+    </body></html>`;
+    const findings = genericHtmlChecks("https://x.example/", html);
+    expect(findings.some((f) => f.category === "forms" && f.title.includes("unlabeled"))).toBe(
+      false
+    );
+  });
+
+  it("does not falsely call a control unlabeled merely for lacking label[for] when aria-labelledby is present", () => {
+    const html = `<html><head><title>x-page-title-long-enough</title><meta name="viewport" content="width=device-width"><meta name="description" content="a description that is long enough to pass the seventy character minimum length check easily"><link rel="canonical" href="https://x.example/"></head><body><h1>x</h1>
+      <span id="email-label">Email</span>
+      <form><input name="email" aria-labelledby="email-label"></form>
+    </body></html>`;
+    const findings = genericHtmlChecks("https://x.example/", html);
+    expect(findings.some((f) => f.category === "forms" && f.title.includes("unlabeled"))).toBe(
+      false
+    );
+  });
+
+  it("still reports a genuinely unlabeled control as a verified defect", () => {
+    const html = `<html><head><title>x-page-title-long-enough</title><meta name="viewport" content="width=device-width"><meta name="description" content="a description that is long enough to pass the seventy character minimum length check easily"><link rel="canonical" href="https://x.example/"></head><body><h1>x</h1>
+      <form><input name="email"></form>
+    </body></html>`;
+    const findings = genericHtmlChecks("https://x.example/", html);
+    const unlabeled = findings.find(
+      (f) => f.category === "forms" && f.title.includes("unlabeled")
+    );
+    expect(unlabeled).toBeTruthy();
+    expect(unlabeled?.evidence).toBe("verified");
+    expect(unlabeled?.severity).toBe("important");
+  });
+
+  it("does not call a linked image with a useful alt an unnamed link", () => {
+    const html = `<html><head><title>x-page-title-long-enough</title><meta name="viewport" content="width=device-width"><meta name="description" content="a description that is long enough to pass the seventy character minimum length check easily"><link rel="canonical" href="https://x.example/"></head><body><h1>x</h1>
+      <a href="/menu"><img src="menu-icon.png" alt="Voir le menu"></a>
+    </body></html>`;
+    const findings = genericHtmlChecks("https://x.example/", html);
+    expect(findings.some((f) => f.title === "Links without an accessible name")).toBe(false);
+  });
+
   it("never emits a FR/AR, hreflang, or RTL finding — those are ReelHaus-only", () => {
     const html = `<html lang="en"><head><title>x-page-title-long-enough</title></head><body><h1>x</h1></body></html>`;
     const findings = genericHtmlChecks("https://x.example/", html);

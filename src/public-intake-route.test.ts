@@ -54,6 +54,7 @@ function baseDeps(overrides: Partial<Parameters<typeof handlePublicReelScanReque
     turnstileSecretKey: "secret",
     rateLimitPepper: "pepper",
     callerIp: "203.0.113.5",
+    scheduleQueueProcessing: async () => {},
     ...overrides
   };
 }

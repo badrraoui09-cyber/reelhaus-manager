@@ -124,14 +124,15 @@ describe("InMemoryPublicIntakeStore — concurrency reservation", () => {
   });
 });
 
-describe("InMemoryPublicIntakeStore — target cooldown lookups", () => {
-  it("returns the most recent scan timestamp for a target key", () => {
+describe("InMemoryPublicIntakeStore — target cooldown/reuse lookups (Task #5A-fix §6)", () => {
+  it("returns the most recent COMPLETED scan for a target, with its scanId", () => {
     const store = new InMemoryPublicIntakeStore();
     store.insertRequest(
       record({
         id: "a",
         scanTargetKey: "lepetitcafe.example",
         requestStatus: "scan_ready_needs_review",
+        scanId: "scan-old",
         createdAt: "2026-08-16T10:00:00.000Z"
       })
     );
@@ -139,26 +140,111 @@ describe("InMemoryPublicIntakeStore — target cooldown lookups", () => {
       record({
         id: "b",
         scanTargetKey: "lepetitcafe.example",
+        requestStatus: "scan_ready_needs_review",
+        scanId: "scan-new",
+        createdAt: "2026-08-17T10:00:00.000Z"
+      })
+    );
+    expect(store.latestCompletedScanForTarget("lepetitcafe.example")).toEqual({
+      scanId: "scan-new",
+      createdAt: "2026-08-17T10:00:00.000Z"
+    });
+  });
+
+  it("does not treat a failed scan as a completed one to reuse", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        scanTargetKey: "lepetitcafe.example",
         requestStatus: "analysis_failed",
         createdAt: "2026-08-17T10:00:00.000Z"
       })
     );
-    expect(store.lastScanAtForTarget("lepetitcafe.example")).toBe(
+    expect(store.latestCompletedScanForTarget("lepetitcafe.example")).toBeNull();
+  });
+
+  it("returns null for a target that has never completed a scan", () => {
+    const store = new InMemoryPublicIntakeStore();
+    expect(store.latestCompletedScanForTarget("never-seen.example")).toBeNull();
+  });
+
+  it("returns the most recent failed-scan timestamp for a target", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        scanTargetKey: "lepetitcafe.example",
+        requestStatus: "analysis_failed",
+        createdAt: "2026-08-17T10:00:00.000Z"
+      })
+    );
+    expect(store.latestFailedScanAtForTarget("lepetitcafe.example")).toBe(
       "2026-08-17T10:00:00.000Z"
     );
   });
 
-  it("returns null for a target that has never been scanned", () => {
-    const store = new InMemoryPublicIntakeStore();
-    expect(store.lastScanAtForTarget("never-seen.example")).toBeNull();
-  });
-
-  it("does not count a merely-received (not yet attempted) request as a scan", () => {
+  it("does not count a merely-queued (not yet attempted) request as a failure", () => {
     const store = new InMemoryPublicIntakeStore();
     store.insertRequest(
-      record({ scanTargetKey: "lepetitcafe.example", requestStatus: "received" })
+      record({ scanTargetKey: "lepetitcafe.example", requestStatus: "queued_for_scan" })
     );
-    expect(store.lastScanAtForTarget("lepetitcafe.example")).toBeNull();
+    expect(store.latestFailedScanAtForTarget("lepetitcafe.example")).toBeNull();
+  });
+
+  it("reports a target as currently scanning only while a fresh scanning row exists", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        scanTargetKey: "lepetitcafe.example",
+        requestStatus: "scanning",
+        updatedAt: "2026-08-17T09:59:30.000Z" // 30s old
+      })
+    );
+    expect(
+      store.isTargetCurrentlyScanning(
+        "lepetitcafe.example",
+        "2026-08-17T10:00:00.000Z",
+        120_000
+      )
+    ).toBe(true);
+  });
+
+  it("a STALE scanning row does not block a new attempt at the same target", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        scanTargetKey: "lepetitcafe.example",
+        requestStatus: "scanning",
+        updatedAt: "2026-08-17T09:00:00.000Z" // 1h old — well past a 2-minute max age
+      })
+    );
+    expect(
+      store.isTargetCurrentlyScanning(
+        "lepetitcafe.example",
+        "2026-08-17T10:00:00.000Z",
+        120_000
+      )
+    ).toBe(false);
+  });
+});
+
+describe("InMemoryPublicIntakeStore — intake queue listing", () => {
+  it("lists queued_for_scan requests oldest first", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({ id: "b", requestStatus: "queued_for_scan", createdAt: "2026-08-17T11:00:00.000Z" })
+    );
+    store.insertRequest(
+      record({ id: "a", requestStatus: "queued_for_scan", createdAt: "2026-08-17T10:00:00.000Z" })
+    );
+    store.insertRequest(record({ id: "c", requestStatus: "scanning" }));
+    expect(store.listQueuedForScan(10).map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  it("respects the batch limit", () => {
+    const store = new InMemoryPublicIntakeStore();
+    for (let i = 0; i < 5; i++)
+      store.insertRequest(record({ id: `q-${i}`, requestStatus: "queued_for_scan" }));
+    expect(store.listQueuedForScan(2)).toHaveLength(2);
   });
 });
 

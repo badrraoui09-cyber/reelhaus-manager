@@ -232,6 +232,7 @@ export function inboundStatusLabel(status: RequestStatus): string {
   return {
     received: "Received / waiting",
     needs_target_review: "Needs target review",
+    queued_for_scan: "Queued",
     scanning: "Scanning",
     scan_ready_needs_review: "Needs review",
     analysis_failed: "Analysis failed"

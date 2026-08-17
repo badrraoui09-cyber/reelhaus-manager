@@ -169,6 +169,7 @@ function fakeReport(): AuditReport {
         page: "https://reelhaus.de/fr/",
         title: "Visuelles responsives Layout manuell prüfen",
         detail: "Ein Worker analysiert HTML, rendert aber keine Browser-Viewports.",
+        rootKey: "responsive:manual-check-note",
         evidence: "inference"
       }
     ],
@@ -900,6 +901,132 @@ describe("Problem 2 & 5 — deterministic consolidation of duplicate categories/
   });
 });
 
+describe("Task #5A-fix §3 — consolidation keys on rootFindingKey, not raw category", () => {
+  it("does NOT consolidate two distinct form defects that share the 'forms' observationType", () => {
+    const unlabeled = guardianEvidence({
+      id: "ev-unlabeled",
+      observationType: "forms",
+      metadata: {
+        severity: "important",
+        verification: "verified",
+        rootFindingKey: "forms:unlabeled-controls:form-1"
+      }
+    });
+    const unnamed = guardianEvidence({
+      id: "ev-unnamed",
+      observationType: "forms",
+      metadata: {
+        severity: "important",
+        verification: "verified",
+        rootFindingKey: "forms:unnamed-controls:form-1"
+      }
+    });
+    const evidenceById = new Map([
+      [unlabeled.id, unlabeled],
+      [unnamed.id, unnamed]
+    ]);
+    const findings = [
+      calFinding({
+        title: "Form has unlabeled fields",
+        category: "action_path",
+        evidenceIds: [unlabeled.id]
+      }),
+      calFinding({
+        title: "Form has fields without a name",
+        category: "action_path",
+        evidenceIds: [unnamed.id]
+      })
+    ];
+    const consolidated = consolidateFindings(findings, evidenceById);
+    expect(consolidated).toHaveLength(2);
+    expect(consolidated.map((f) => f.title).sort()).toEqual(
+      ["Form has fields without a name", "Form has unlabeled fields"].sort()
+    );
+  });
+
+  it("does NOT consolidate two distinct accessibility defects that share the 'accessibility' observationType", () => {
+    const missingAlt = guardianEvidence({
+      id: "ev-alt",
+      observationType: "accessibility",
+      metadata: {
+        severity: "important",
+        verification: "verified",
+        rootFindingKey: "accessibility:missing-alt"
+      }
+    });
+    const h1Issue = guardianEvidence({
+      id: "ev-h1",
+      observationType: "accessibility",
+      metadata: {
+        severity: "important",
+        verification: "verified",
+        rootFindingKey: "accessibility:h1-structure"
+      }
+    });
+    const evidenceById = new Map([
+      [missingAlt.id, missingAlt],
+      [h1Issue.id, h1Issue]
+    ]);
+    const findings = [
+      calFinding({ title: "Images without alt", evidenceIds: [missingAlt.id] }),
+      calFinding({ title: "H1 structure problem", evidenceIds: [h1Issue.id] })
+    ];
+    expect(consolidateFindings(findings, evidenceById)).toHaveLength(2);
+  });
+
+  it("still consolidates the same rootFindingKey across FR + AR locale pages into one finding", () => {
+    const fr = guardianEvidence({
+      id: "ev-fr-viewport",
+      sourceUrl: "https://reelhaus.de/fr/",
+      observationType: "responsive",
+      metadata: {
+        severity: "critical",
+        verification: "verified",
+        rootFindingKey: "responsive:missing-viewport"
+      }
+    });
+    const ar = guardianEvidence({
+      id: "ev-ar-viewport",
+      sourceUrl: "https://reelhaus.de/ar/",
+      observationType: "responsive",
+      metadata: {
+        severity: "critical",
+        verification: "verified",
+        rootFindingKey: "responsive:missing-viewport"
+      }
+    });
+    const evidenceById = new Map([
+      [fr.id, fr],
+      [ar.id, ar]
+    ]);
+    const findings = [
+      calFinding({ title: "Mobile viewport missing (FR)", evidenceIds: [fr.id] }),
+      calFinding({ title: "Mobile viewport missing (AR)", evidenceIds: [ar.id] })
+    ];
+    const consolidated = consolidateFindings(findings, evidenceById);
+    expect(consolidated).toHaveLength(1);
+    expect(consolidated[0].evidenceIds.slice().sort()).toEqual([fr.id, ar.id].sort());
+  });
+
+  it("still consolidates the same evidence cited under two different AI-chosen categories (technical + mobile)", () => {
+    const viewport = guardianEvidence({
+      id: "ev-viewport",
+      observationType: "responsive",
+      metadata: {
+        severity: "critical",
+        verification: "verified",
+        rootFindingKey: "responsive:missing-viewport"
+      }
+    });
+    const evidenceById = new Map([[viewport.id, viewport]]);
+    const findings = [
+      calFinding({ category: "technical", evidenceIds: [viewport.id] }),
+      calFinding({ category: "mobile", evidenceIds: [viewport.id] })
+    ];
+    expect(consolidateFindings(findings, evidenceById)).toHaveLength(1);
+  });
+});
+
 describe("Problem 3 — action-link evidence distinguishes occurrences from unique destinations", () => {
   it("reports total occurrences separately from unique destinations, not one collapsed count", async () => {
     const html = `<!DOCTYPE html><html lang="fr"><head><title>t</title></head><body>
@@ -993,6 +1120,34 @@ describe("Problem 4 — verified defects are guaranteed to be considered", () =>
     expect(derived).toHaveLength(1);
     expect(derived[0].evidenceIds.slice().sort()).toEqual(
       ["ev-form", "ev-form-ar"].sort()
+    );
+  });
+
+  it("Task #5A-fix §3 regression: two distinct verified 'forms' defects are injected as two separate findings, not merged", () => {
+    const unlabeled = guardianEvidence({
+      id: "ev-unlabeled",
+      observationType: "forms",
+      observation: "Formular 1 enthält unbeschriftete Felder: 2 Formularelemente.",
+      metadata: {
+        severity: "important",
+        verification: "verified",
+        rootFindingKey: "forms:unlabeled-controls:form-1"
+      }
+    });
+    const unnamed = guardianEvidence({
+      id: "ev-unnamed",
+      observationType: "forms",
+      observation: "Formular 1 enthält Felder ohne name: 1 Formularelement.",
+      metadata: {
+        severity: "important",
+        verification: "verified",
+        rootFindingKey: "forms:unnamed-controls:form-1"
+      }
+    });
+    const derived = deriveDeterministicFindings([unlabeled, unnamed], new Set());
+    expect(derived).toHaveLength(2);
+    expect(derived.map((f) => f.evidenceIds[0]).sort()).toEqual(
+      ["ev-unlabeled", "ev-unnamed"].sort()
     );
   });
 

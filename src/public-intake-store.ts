@@ -12,6 +12,7 @@ import type { SubmittedLinkKind } from "./link-classifier";
 export const REQUEST_STATUSES = [
   "received",
   "needs_target_review",
+  "queued_for_scan",
   "scanning",
   "scan_ready_needs_review",
   "analysis_failed"
@@ -77,7 +78,23 @@ export interface PublicIntakeStore {
     maxAgeMs: number
   ): boolean;
 
-  lastScanAtForTarget(scanTargetKey: string): string | null;
+  /** Oldest-first, bounded — the intake queue's work list for one pass. */
+  listQueuedForScan(limit: number): InboundRequestRecord[];
+
+  /** The most recent SUCCESSFULLY completed scan for a target, if any — used to reuse a fresh result instead of re-scanning. */
+  latestCompletedScanForTarget(
+    scanTargetKey: string
+  ): { scanId: string; createdAt: string } | null;
+
+  /** When the most recent FAILED scan for a target happened, if any — a much shorter backoff than the success cooldown. */
+  latestFailedScanAtForTarget(scanTargetKey: string): string | null;
+
+  /** Whether a (non-stale) scan is currently in flight for this target — used to avoid launching a duplicate concurrent scan of the same URL. */
+  isTargetCurrentlyScanning(
+    scanTargetKey: string,
+    nowIso: string,
+    maxAgeMs: number
+  ): boolean;
 
   getRateLimitWindow(key: string): RateLimitWindowRecord | null;
   /** Atomically increments-or-starts the window for `key` in one operation. */
@@ -138,17 +155,51 @@ export class InMemoryPublicIntakeStore implements PublicIntakeStore {
     return true;
   }
 
-  lastScanAtForTarget(scanTargetKey: string): string | null {
+  listQueuedForScan(limit: number): InboundRequestRecord[] {
+    return [...this.requests.values()]
+      .filter((record) => record.requestStatus === "queued_for_scan")
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .slice(0, limit);
+  }
+
+  latestCompletedScanForTarget(
+    scanTargetKey: string
+  ): { scanId: string; createdAt: string } | null {
     const matches = [...this.requests.values()]
       .filter(
         (record) =>
           record.scanTargetKey === scanTargetKey &&
-          (record.requestStatus === "scanning" ||
-            record.requestStatus === "scan_ready_needs_review" ||
-            record.requestStatus === "analysis_failed")
+          record.requestStatus === "scan_ready_needs_review" &&
+          record.scanId
+      )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const match = matches[0];
+    return match ? { scanId: match.scanId!, createdAt: match.createdAt } : null;
+  }
+
+  latestFailedScanAtForTarget(scanTargetKey: string): string | null {
+    const matches = [...this.requests.values()]
+      .filter(
+        (record) =>
+          record.scanTargetKey === scanTargetKey &&
+          record.requestStatus === "analysis_failed"
       )
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return matches[0]?.createdAt || null;
+  }
+
+  isTargetCurrentlyScanning(
+    scanTargetKey: string,
+    nowIso: string,
+    maxAgeMs: number
+  ): boolean {
+    const nowMs = Date.parse(nowIso);
+    return [...this.requests.values()].some(
+      (record) =>
+        record.scanTargetKey === scanTargetKey &&
+        record.requestStatus === "scanning" &&
+        nowMs - Date.parse(record.updatedAt) <= maxAgeMs
+    );
   }
 
   getRateLimitWindow(key: string): RateLimitWindowRecord | null {
@@ -347,17 +398,60 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
     return true;
   }
 
-  lastScanAtForTarget(scanTargetKey: string): string | null {
+  listQueuedForScan(limit: number): InboundRequestRecord[] {
+    return this.sql
+      .exec<SqlRow>(
+        `SELECT * FROM inbound_requests WHERE request_status = 'queued_for_scan'
+         ORDER BY created_at ASC LIMIT ?`,
+        limit
+      )
+      .toArray()
+      .map(mapRequestRow);
+  }
+
+  latestCompletedScanForTarget(
+    scanTargetKey: string
+  ): { scanId: string; createdAt: string } | null {
+    const row = this.sql
+      .exec<{ scan_id: string; created_at: string }>(
+        `SELECT scan_id, created_at FROM inbound_requests
+         WHERE scan_target_key = ? AND request_status = 'scan_ready_needs_review'
+           AND scan_id IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1`,
+        scanTargetKey
+      )
+      .toArray()[0];
+    return row ? { scanId: row.scan_id, createdAt: row.created_at } : null;
+  }
+
+  latestFailedScanAtForTarget(scanTargetKey: string): string | null {
     const row = this.sql
       .exec<{ created_at: string }>(
         `SELECT created_at FROM inbound_requests
-         WHERE scan_target_key = ?
-           AND request_status IN ('scanning', 'scan_ready_needs_review', 'analysis_failed')
+         WHERE scan_target_key = ? AND request_status = 'analysis_failed'
          ORDER BY created_at DESC LIMIT 1`,
         scanTargetKey
       )
       .toArray()[0];
     return row ? row.created_at : null;
+  }
+
+  isTargetCurrentlyScanning(
+    scanTargetKey: string,
+    nowIso: string,
+    maxAgeMs: number
+  ): boolean {
+    const cutoffIso = new Date(Date.parse(nowIso) - maxAgeMs).toISOString();
+    const row = this.sql
+      .exec<{ found: number }>(
+        `SELECT 1 AS found FROM inbound_requests
+         WHERE scan_target_key = ? AND request_status = 'scanning' AND updated_at > ?
+         LIMIT 1`,
+        scanTargetKey,
+        cutoffIso
+      )
+      .toArray()[0];
+    return Boolean(row);
   }
 
   getRateLimitWindow(key: string): RateLimitWindowRecord | null {

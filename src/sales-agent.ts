@@ -2,8 +2,9 @@ import { Agent } from "agents";
 import { checkAiHealth } from "./ai-service";
 import { AuditLedgerService, SqlAuditLedgerStore } from "./audit-ledger";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
+import { QUEUE_BATCH_LIMIT, QUEUE_RETRY_DELAY_SECONDS } from "./public-intake-config";
 import { handlePublicReelScanRequest } from "./public-intake-route";
-import { listInboundRequestsForManager } from "./public-intake-service";
+import { PublicIntakeService, listInboundRequestsForManager } from "./public-intake-service";
 import { SqlPublicIntakeStore } from "./public-intake-store";
 import { runReelScanV1ClientZero } from "./reelscan";
 import {
@@ -528,8 +529,46 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       fetcher: fetch,
       turnstileSecretKey: this.env.TURNSTILE_SECRET_KEY,
       rateLimitPepper: this.env.PUBLIC_RATE_LIMIT_PEPPER,
-      callerIp: request.headers.get("cf-connecting-ip")
+      callerIp: request.headers.get("cf-connecting-ip"),
+      scheduleQueueProcessing: () => this.scheduleInboundScanQueue()
     });
+  }
+
+  // Task #5A-fix §5 — a tiny, free-first intake queue built on the agents
+  // SDK's own schedule() (SQLite-backed, idempotent by callback+payload,
+  // itself built on a single Durable Object alarm this class never touches
+  // directly — see the PublicIntakeDeps.scheduleQueueProcessing doc
+  // comment in public-intake-service.ts for why this mechanism was chosen
+  // over a hand-rolled alarm() handler). idempotent:true means repeated
+  // calls (once per accepted website submission) collapse onto the same
+  // pending run instead of accumulating duplicate schedule rows.
+  private async scheduleInboundScanQueue(): Promise<void> {
+    await this.schedule(0, "processInboundScanQueue", undefined, { idempotent: true });
+  }
+
+  /**
+   * The intake queue's scheduled callback (named exactly as passed to
+   * schedule() above — the agents SDK invokes methods by name). All the
+   * actual queue-processing logic (cooldown/reuse, in-flight-target dedup,
+   * concurrency reservation, terminal-state guarantee) lives in
+   * PublicIntakeService.processQueue(), fully unit tested without a
+   * Durable Object; this method is deliberately a thin wrapper that also
+   * decides whether to re-arm — the one piece that genuinely needs
+   * this.schedule().
+   */
+  async processInboundScanQueue(): Promise<void> {
+    const service = new PublicIntakeService({
+      store: this.publicIntakeStore,
+      auditLedger: this.auditLedger,
+      ai: this.env.AI,
+      fetcher: fetch,
+      scheduleQueueProcessing: () => this.scheduleInboundScanQueue()
+    });
+    const { remainingQueued } = await service.processQueue(Date.now(), QUEUE_BATCH_LIMIT);
+    if (remainingQueued)
+      await this.schedule(QUEUE_RETRY_DELAY_SECONDS, "processInboundScanQueue", undefined, {
+        idempotent: true
+      });
   }
 
   private usage(day = new Date().toISOString().slice(0, 10)) {

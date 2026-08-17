@@ -61,6 +61,8 @@ export interface PublicIntakeRouteDeps {
   turnstileSecretKey: string | undefined;
   rateLimitPepper: string | undefined;
   callerIp: string | null;
+  /** See PublicIntakeDeps.scheduleQueueProcessing (public-intake-service.ts). */
+  scheduleQueueProcessing: () => Promise<void>;
 }
 
 export async function handlePublicReelScanRequest(
@@ -135,7 +137,8 @@ export async function handlePublicReelScanRequest(
       store: deps.store,
       auditLedger: deps.auditLedger,
       ai: deps.ai,
-      fetcher: deps.fetcher
+      fetcher: deps.fetcher,
+      scheduleQueueProcessing: deps.scheduleQueueProcessing
     };
     const outcome = await new PublicIntakeService(serviceDeps).submit(
       parsed.value,

@@ -17,6 +17,16 @@ export interface Finding {
   title: string;
   detail: string;
   evidence: EvidenceType;
+  /**
+   * A stable, locale-independent identifier for the underlying defect this
+   * finding represents — e.g. "forms:unlabeled-controls:form-1",
+   * "responsive:missing-viewport". Used (via EvidenceRecord.metadata) to
+   * consolidate the SAME defect across FR/AR locale pages into one
+   * finding while keeping genuinely DISTINCT defects (even ones that
+   * happen to share a broad `category`, like two different form problems)
+   * separate. See reelscan.ts's consolidateFindings() and Task #5A-fix §3.
+   */
+  rootKey: string;
 }
 
 export interface PageSnapshot {
@@ -50,7 +60,7 @@ export interface AuditReport {
   systemInstruction?: string;
 }
 
-interface HtmlFacts {
+export interface HtmlFacts {
   title: string;
   bodyText: string;
   htmlLang: string;
@@ -60,8 +70,20 @@ interface HtmlFacts {
   alternates: Map<string, string>;
   h1Count: number;
   images: Array<{ src: string; alt: string | null }>;
-  links: Array<{ href: string; text: string; ariaLabel: string | null }>;
-  buttons: Array<{ text: string; ariaLabel: string | null }>;
+  links: Array<{
+    href: string;
+    text: string;
+    ariaLabel: string | null;
+    ariaLabelledBy: string | null;
+    /** A descendant <img alt="..."> with a non-empty alt supplies an accessible name too. */
+    hasNamedDescendantImg: boolean;
+  }>;
+  buttons: Array<{
+    text: string;
+    ariaLabel: string | null;
+    ariaLabelledBy: string | null;
+    hasNamedDescendantImg: boolean;
+  }>;
   forms: Array<{
     action: string | null;
     method: string | null;
@@ -70,6 +92,7 @@ interface HtmlFacts {
       name: string | null;
       type: string;
       ariaLabel: string | null;
+      ariaLabelledBy: string | null;
       hasWrappingLabel: boolean;
     }>;
   }>;
@@ -92,9 +115,10 @@ function finding(
   page: string,
   title: string,
   detail: string,
+  rootKey: string,
   evidence: EvidenceType = "verified"
 ): Finding {
-  return { severity, category, page, title, detail, evidence };
+  return { severity, category, page, title, detail, rootKey, evidence };
 }
 
 function timeoutSignal(milliseconds: number): AbortSignal {
@@ -128,7 +152,7 @@ async function fetchPage(
   return response;
 }
 
-async function parseHtml(response: Response): Promise<HtmlFacts> {
+export async function parseHtml(response: Response): Promise<HtmlFacts> {
   const facts: HtmlFacts = {
     title: "",
     bodyText: "",
@@ -145,6 +169,16 @@ async function parseHtml(response: Response): Promise<HtmlFacts> {
     labelFors: new Set()
   };
   let activeForm: HtmlFacts["forms"][number] | undefined;
+  // HTML supports label association two ways: explicit label[for] (tracked
+  // via facts.labelFors below) and implicit association when a labelable
+  // control is a descendant of a <label> element. A form control's open
+  // tag is always processed by HTMLRewriter after its ancestor <label>'s
+  // open tag (streaming, document order), so a simple open/close depth
+  // counter — the same onEndTag pattern already used for activeForm below
+  // — correctly captures "currently inside a <label>" at the moment a
+  // control is encountered. Labels do not nest in valid HTML, but the
+  // counter tolerates malformed markup rather than assuming exactly 0/1.
+  let labelDepth = 0;
 
   const rewriter = new HTMLRewriter()
     .on("html", {
@@ -202,7 +236,9 @@ async function parseHtml(response: Response): Promise<HtmlFacts> {
         facts.links.push({
           href: element.getAttribute("href") || "",
           text: "",
-          ariaLabel: element.getAttribute("aria-label")
+          ariaLabel: element.getAttribute("aria-label"),
+          ariaLabelledBy: element.getAttribute("aria-labelledby"),
+          hasNamedDescendantImg: false
         });
       },
       text(text) {
@@ -210,11 +246,20 @@ async function parseHtml(response: Response): Promise<HtmlFacts> {
         if (current) current.text += text.text;
       }
     })
+    .on("a[href] img", {
+      element(element) {
+        const current = facts.links.at(-1);
+        if (current && (element.getAttribute("alt") || "").trim())
+          current.hasNamedDescendantImg = true;
+      }
+    })
     .on("button", {
       element(element) {
         facts.buttons.push({
           text: "",
-          ariaLabel: element.getAttribute("aria-label")
+          ariaLabel: element.getAttribute("aria-label"),
+          ariaLabelledBy: element.getAttribute("aria-labelledby"),
+          hasNamedDescendantImg: false
         });
       },
       text(text) {
@@ -222,10 +267,25 @@ async function parseHtml(response: Response): Promise<HtmlFacts> {
         if (current) current.text += text.text;
       }
     })
+    .on("button img", {
+      element(element) {
+        const current = facts.buttons.at(-1);
+        if (current && (element.getAttribute("alt") || "").trim())
+          current.hasNamedDescendantImg = true;
+      }
+    })
     .on("label[for]", {
       element(element) {
         const target = element.getAttribute("for");
         if (target) facts.labelFors.add(target);
+      }
+    })
+    .on("label", {
+      element(element) {
+        labelDepth += 1;
+        element.onEndTag(() => {
+          labelDepth = Math.max(0, labelDepth - 1);
+        });
       }
     })
     .on("form", {
@@ -248,7 +308,8 @@ async function parseHtml(response: Response): Promise<HtmlFacts> {
           name: element.getAttribute("name"),
           type: (element.getAttribute("type") || element.tagName).toLowerCase(),
           ariaLabel: element.getAttribute("aria-label"),
-          hasWrappingLabel: false
+          ariaLabelledBy: element.getAttribute("aria-labelledby"),
+          hasWrappingLabel: labelDepth > 0
         });
       }
     });
@@ -299,7 +360,8 @@ async function checkInternalLinks(
             "links",
             pageUrl,
             "Interner Link konnte nicht geprüft werden",
-            `${url}: ${String(result.reason)}`
+            `${url}: ${String(result.reason)}`,
+            `links:check-failed:${url}`
           )
         );
       } else if (result.value.status >= 400) {
@@ -309,7 +371,8 @@ async function checkInternalLinks(
             "links",
             pageUrl,
             "Interner Link ist nicht erreichbar",
-            `${url} antwortete mit HTTP ${result.value.status}.`
+            `${url} antwortete mit HTTP ${result.value.status}.`,
+            `links:unreachable:${url}`
           )
         );
       }
@@ -318,7 +381,7 @@ async function checkInternalLinks(
   return { checked: selected.length, findings };
 }
 
-function inspectFacts(
+export function inspectFacts(
   pageUrl: string,
   language: "fr" | "ar",
   expectsRtl: boolean,
@@ -332,7 +395,14 @@ function inspectFacts(
 
   if (!facts.title) {
     issues.push(
-      finding("important", "metadata", pageUrl, "Seitentitel fehlt", "Kein <title> gefunden.")
+      finding(
+        "important",
+        "metadata",
+        pageUrl,
+        "Seitentitel fehlt",
+        "Kein <title> gefunden.",
+        "metadata:missing-title"
+      )
     );
   } else if (facts.title.length < 15 || facts.title.length > 65) {
     issues.push(
@@ -341,13 +411,21 @@ function inspectFacts(
         "seo",
         pageUrl,
         "Seitentitel-Länge prüfen",
-        `Der Titel hat ${facts.title.length} Zeichen; üblich sind etwa 15–65.`
+        `Der Titel hat ${facts.title.length} Zeichen; üblich sind etwa 15–65.`,
+        "seo:title-length"
       )
     );
   }
   if (!description) {
     issues.push(
-      finding("important", "metadata", pageUrl, "Meta-Description fehlt", "Keine Meta-Description gefunden.")
+      finding(
+        "important",
+        "metadata",
+        pageUrl,
+        "Meta-Description fehlt",
+        "Keine Meta-Description gefunden.",
+        "metadata:missing-description"
+      )
     );
   } else if (description.length < 70 || description.length > 170) {
     issues.push(
@@ -356,13 +434,21 @@ function inspectFacts(
         "seo",
         pageUrl,
         "Meta-Description-Länge prüfen",
-        `Die Description hat ${description.length} Zeichen; üblich sind etwa 70–170.`
+        `Die Description hat ${description.length} Zeichen; üblich sind etwa 70–170.`,
+        "seo:description-length"
       )
     );
   }
   if (!facts.canonical) {
     issues.push(
-      finding("important", "seo", pageUrl, "Canonical URL fehlt", "Kein rel=canonical gefunden.")
+      finding(
+        "important",
+        "seo",
+        pageUrl,
+        "Canonical URL fehlt",
+        "Kein rel=canonical gefunden.",
+        "seo:missing-canonical"
+      )
     );
   }
   if (!facts.htmlLang.toLowerCase().startsWith(language)) {
@@ -372,18 +458,33 @@ function inspectFacts(
         "language",
         pageUrl,
         "Dokumentsprache stimmt nicht",
-        `Erwartet wurde lang="${language}", gefunden wurde "${facts.htmlLang || "kein Wert"}".`
+        `Erwartet wurde lang="${language}", gefunden wurde "${facts.htmlLang || "kein Wert"}".`,
+        "language:lang-mismatch"
       )
     );
   }
   if (expectsRtl && facts.htmlDir.toLowerCase() !== "rtl") {
     issues.push(
-      finding("critical", "rtl", pageUrl, "Arabische Seite ist nicht als RTL markiert", 'Am <html>-Element fehlt dir="rtl".')
+      finding(
+        "critical",
+        "rtl",
+        pageUrl,
+        "Arabische Seite ist nicht als RTL markiert",
+        'Am <html>-Element fehlt dir="rtl".',
+        "rtl:missing-rtl"
+      )
     );
   }
   if (!expectsRtl && facts.htmlDir.toLowerCase() === "rtl") {
     issues.push(
-      finding("important", "rtl", pageUrl, "Französische Seite ist als RTL markiert", 'dir="rtl" ist für die französische Seite unerwartet.')
+      finding(
+        "important",
+        "rtl",
+        pageUrl,
+        "Französische Seite ist als RTL markiert",
+        'dir="rtl" ist für die französische Seite unerwartet.',
+        "rtl:unexpected-rtl"
+      )
     );
   }
   if (language === "ar" && latinChars > arabicChars * 2 && latinChars > 200) {
@@ -394,6 +495,7 @@ function inspectFacts(
         pageUrl,
         "Arabischer Inhalt wirkt sprachlich inkonsistent",
         `Zeichen-Heuristik: ${arabicChars} arabische und ${latinChars} lateinische Buchstaben.`,
+        "language:ar-content-heuristic",
         "inference"
       )
     );
@@ -406,13 +508,21 @@ function inspectFacts(
         pageUrl,
         "Französischer Inhalt wirkt sprachlich inkonsistent",
         `Zeichen-Heuristik: ${latinChars} lateinische und ${arabicChars} arabische Buchstaben.`,
+        "language:fr-content-heuristic",
         "inference"
       )
     );
   }
   if (!viewport.toLowerCase().includes("width=device-width")) {
     issues.push(
-      finding("critical", "responsive", pageUrl, "Mobiler Viewport fehlt", 'Meta viewport mit "width=device-width" wurde nicht gefunden.')
+      finding(
+        "critical",
+        "responsive",
+        pageUrl,
+        "Mobiler Viewport fehlt",
+        'Meta viewport mit "width=device-width" wurde nicht gefunden.',
+        "responsive:missing-viewport"
+      )
     );
   }
   issues.push(
@@ -422,6 +532,7 @@ function inspectFacts(
       pageUrl,
       "Visuelles responsives Layout manuell prüfen",
       "Ein Worker analysiert HTML, rendert aber keine Browser-Viewports. Überläufe, Touch-Ziele und Breakpoints sind daher nicht visuell verifiziert.",
+      "responsive:manual-check-note",
       "inference"
     )
   );
@@ -432,7 +543,8 @@ function inspectFacts(
         "accessibility",
         pageUrl,
         "H1-Struktur prüfen",
-        `Gefundene H1-Überschriften: ${facts.h1Count}; erwartet wird eine klare Hauptüberschrift.`
+        `Gefundene H1-Überschriften: ${facts.h1Count}; erwartet wird eine klare Hauptüberschrift.`,
+        "accessibility:h1-structure"
       )
     );
   }
@@ -444,13 +556,31 @@ function inspectFacts(
         "accessibility",
         pageUrl,
         "Bilder ohne alt-Attribut",
-        `${missingAlts.length} von ${facts.images.length} Bildern haben kein alt-Attribut.`
+        `${missingAlts.length} von ${facts.images.length} Bildern haben kein alt-Attribut.`,
+        "accessibility:missing-alt"
       )
     );
   }
-  const emptyLinks = facts.links.filter(
-    (link) => !cleanText(link.text) && !link.ariaLabel
-  );
+  // Conservative, deterministic accessible-name check — NOT a full browser
+  // accessible-name computation. A link/button is only flagged when none
+  // of the common safe signals are present: visible text, aria-label,
+  // aria-labelledby (presence only — the referenced element's text is not
+  // resolved, so this deliberately errs toward "has a name"), or a
+  // descendant <img alt="..."> supplying the name (e.g. an icon-only link).
+  const hasAccessibleName = (item: {
+    text: string;
+    ariaLabel: string | null;
+    ariaLabelledBy: string | null;
+    hasNamedDescendantImg: boolean;
+  }): boolean =>
+    Boolean(
+      cleanText(item.text) ||
+        item.ariaLabel ||
+        item.ariaLabelledBy ||
+        item.hasNamedDescendantImg
+    );
+
+  const emptyLinks = facts.links.filter((link) => !hasAccessibleName(link));
   if (emptyLinks.length) {
     issues.push(
       finding(
@@ -458,12 +588,13 @@ function inspectFacts(
         "accessibility",
         pageUrl,
         "Links ohne zugänglichen Namen",
-        `${emptyLinks.length} Links enthalten weder Text noch aria-label.`
+        `${emptyLinks.length} Links enthalten weder Text noch aria-label/aria-labelledby noch ein beschriftetes Bild.`,
+        "accessibility:unnamed-links"
       )
     );
   }
   const emptyButtons = facts.buttons.filter(
-    (button) => !cleanText(button.text) && !button.ariaLabel
+    (button) => !hasAccessibleName(button)
   );
   if (emptyButtons.length) {
     issues.push(
@@ -472,15 +603,24 @@ function inspectFacts(
         "accessibility",
         pageUrl,
         "Buttons ohne zugänglichen Namen",
-        `${emptyButtons.length} Buttons enthalten weder Text noch aria-label.`
+        `${emptyButtons.length} Buttons enthalten weder Text noch aria-label/aria-labelledby noch ein beschriftetes Bild.`,
+        "accessibility:unnamed-buttons"
       )
     );
   }
   for (const [index, form] of facts.forms.entries()) {
+    // A control is unlabeled only when NONE of the recognized association
+    // methods apply: explicit label[for], implicit wrapping <label>,
+    // aria-label, or aria-labelledby (presence only, same reasoning as
+    // above). This is the Task #5A-fix §1 correction — hasWrappingLabel
+    // was previously always false, which meant a large class of
+    // conventionally-labeled real-world markup was misreported as a
+    // verified defect.
     const unlabeled = form.controls.filter(
       (control) =>
         control.type !== "hidden" &&
         !control.ariaLabel &&
+        !control.ariaLabelledBy &&
         !control.hasWrappingLabel &&
         (!control.id || !facts.labelFors.has(control.id))
     );
@@ -494,7 +634,8 @@ function inspectFacts(
           "forms",
           pageUrl,
           `Formular ${index + 1} enthält unbeschriftete Felder`,
-          `${unlabeled.length} Formularelemente haben keine erkennbare Beschriftung.`
+          `${unlabeled.length} Formularelemente haben keine erkennbare Beschriftung.`,
+          `forms:unlabeled-controls:form-${index + 1}`
         )
       );
     }
@@ -505,7 +646,8 @@ function inspectFacts(
           "forms",
           pageUrl,
           `Formular ${index + 1} enthält Felder ohne name`,
-          `${unnamed.length} Formularelemente können ohne name nicht regulär übertragen werden.`
+          `${unnamed.length} Formularelemente können ohne name nicht regulär übertragen werden.`,
+          `forms:unnamed-controls:form-${index + 1}`
         )
       );
     }
@@ -517,6 +659,7 @@ function inspectFacts(
           pageUrl,
           `Formular ${index + 1} verwendet GET oder keine Methode`,
           "Bei personenbezogenen oder längeren Eingaben sollte die beabsichtigte Methode geprüft werden.",
+          `forms:get-method-note:form-${index + 1}`,
           "inference"
         )
       );
@@ -529,7 +672,8 @@ function inspectFacts(
         "seo",
         pageUrl,
         "hreflang-Verknüpfung unvollständig",
-        "Beide Sprachalternativen fr und ar sollten per hreflang referenziert sein."
+        "Beide Sprachalternativen fr und ar sollten per hreflang referenziert sein.",
+        "seo:missing-hreflang"
       )
     );
   }
@@ -540,7 +684,8 @@ function inspectFacts(
         "seo",
         pageUrl,
         "Open-Graph-Metadaten unvollständig",
-        "og:title und/oder og:description fehlen."
+        "og:title und/oder og:description fehlen.",
+        "seo:missing-og-metadata"
       )
     );
   }
@@ -573,7 +718,13 @@ export async function analyzeReelHaus(
             "availability",
             target.url,
             "Zielseite ist nicht erfolgreich erreichbar",
-            `HTTP ${response.status} ${response.statusText}`
+            `HTTP ${response.status} ${response.statusText}`,
+            // Deliberately locale-independent (no target.url): the same
+            // underlying problem — the site itself being unreachable —
+            // affecting both FR and AR pages is one root issue, not two.
+            // Contrast with checkInternalLinks() below, where each broken
+            // internal link is a genuinely distinct fact.
+            "availability:unreachable"
           )
         );
         continue;
@@ -586,7 +737,8 @@ export async function analyzeReelHaus(
             "availability",
             target.url,
             "Zielseite liefert kein HTML",
-            `Content-Type: ${contentType || "nicht gesetzt"}`
+            `Content-Type: ${contentType || "nicht gesetzt"}`,
+            "availability:not-html"
           )
         );
         continue;
@@ -622,7 +774,8 @@ export async function analyzeReelHaus(
           "availability",
           target.url,
           "Zielseite konnte nicht analysiert werden",
-          error instanceof Error ? error.message : "Unbekannter Abruffehler"
+          error instanceof Error ? error.message : "Unbekannter Abruffehler",
+          "availability:fetch-error"
         )
       );
     }
