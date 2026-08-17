@@ -658,6 +658,51 @@ export function consolidateFindings(
   return consolidated;
 }
 
+// Task #3D calibration follow-up: a verified Website Guardian defect's
+// severity is ground truth. The AI may cite that evidence in a finding, but
+// it must never be able to quietly downgrade it — e.g. reporting a verified
+// "important" form-labeling defect as "optional". For every surviving
+// "issue" finding, the strongest severity among the verified (not
+// inference) Guardian defect evidence it cites becomes a floor: the final
+// severity is raised to at least that floor, never lowered by it. Findings
+// with no such evidence, or only inference/manual-review evidence, are
+// left exactly as the AI reported them. Notes and strengths are untouched.
+function severityFloorFromEvidence(
+  evidenceIds: string[],
+  evidenceById: ReadonlyMap<string, EvidenceRecord>
+): Severity | null {
+  let floor: Severity | null = null;
+  for (const id of evidenceIds) {
+    const item = evidenceById.get(id);
+    if (!item || item.collector !== GUARDIAN_COLLECTOR) continue;
+    if (evidenceVerification(item) !== "verified") continue;
+    const severity = item.metadata?.severity as Severity | undefined;
+    if (!severity) continue;
+    if (!floor || SEVERITY_RANK[severity] > SEVERITY_RANK[floor]) floor = severity;
+  }
+  return floor;
+}
+
+export function applySeverityFloor(
+  findings: ValidatedReelScanFinding[],
+  evidenceById: ReadonlyMap<string, EvidenceRecord>
+): ValidatedReelScanFinding[] {
+  return findings.map((finding) => {
+    if (finding.kind !== "issue") return finding;
+    const floor = severityFloorFromEvidence(finding.evidenceIds, evidenceById);
+    if (!floor || SEVERITY_RANK[finding.severity] >= SEVERITY_RANK[floor])
+      return finding;
+    return {
+      ...finding,
+      severity: floor,
+      // Reuses the same severity->priority ceiling deriveDeterministicFindings
+      // already applies, so a raised severity can never contradict priority.
+      priority: Math.min(finding.priority, priorityForSeverity(floor)),
+      summary: `${finding.summary} (Severity raised to ${floor}: verified Website Guardian evidence establishes at least this severity; the AI's original assessment did not.)`
+    };
+  });
+}
+
 // Problem 4: a verified, important-or-worse Website Guardian defect must
 // end up in the final finding set even if the AI never mentions it. Only
 // evidence the AI's (post-consolidation) issue findings did NOT already
@@ -934,7 +979,10 @@ export async function runReelScanV1ClientZero(
     );
 
     const downgraded = downgradeUncertainIssues(rawValidated, evidenceById);
-    const consolidatedAi = consolidateFindings(downgraded, evidenceById);
+    const consolidated = consolidateFindings(downgraded, evidenceById);
+    // Applied after consolidation so the floor is computed from the full,
+    // merged evidence set (e.g. FR + AR together), not per pre-merge draft.
+    const consolidatedAi = applySeverityFloor(consolidated, evidenceById);
     const coveredEvidenceIds = new Set(
       consolidatedAi
         .filter((finding) => finding.kind === "issue")

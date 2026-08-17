@@ -7,6 +7,7 @@ import {
   REELSCAN_MODEL,
   REELSCAN_SEVERITY_DEDUCTIONS,
   ReelScanValidationError,
+  applySeverityFloor,
   buildReelScanPrompt,
   calculateReelScanScore,
   collectClientZeroContentEvidence,
@@ -1064,5 +1065,172 @@ describe("Problem 8 — finding provenance", () => {
   it("derives ai vs deterministic from analysisRunId rather than a separate stored column", () => {
     expect(findingOrigin({ analysisRunId: "run-1" })).toBe("ai");
     expect(findingOrigin({ analysisRunId: null })).toBe("deterministic");
+  });
+});
+
+// -- Severity floor (post-3D calibration follow-up) --------------------------
+//
+// AI reported the verified "important" form-labeling defect as "optional" —
+// structurally valid, evidence-backed, just wrong. applySeverityFloor()
+// ensures the AI can never quietly downgrade a verified Guardian defect.
+
+describe("severity floor: verified Guardian defect is a minimum, never lowered", () => {
+  function verifiedFormEvidence(
+    overrides: Partial<EvidenceRecord> = {}
+  ): EvidenceRecord {
+    return guardianEvidence({
+      id: "ev-form",
+      observationType: "forms",
+      observation:
+        "Formular 1 enthält unbeschriftete Felder: 2 Formularelemente haben keine erkennbare Beschriftung.",
+      metadata: { severity: "important", verification: "verified" },
+      ...overrides
+    });
+  }
+
+  it("raises AI severity optional -> important when Guardian evidence is verified important", () => {
+    const evidenceById = new Map([["ev-form", verifiedFormEvidence()]]);
+    const finding = calFinding({
+      title: "Unlabelled Form Fields",
+      category: "action_path",
+      severity: "optional",
+      priority: 5,
+      evidenceIds: ["ev-form"]
+    });
+    const [result] = applySeverityFloor([finding], evidenceById);
+    expect(result.severity).toBe("important");
+  });
+
+  it("raises AI severity optional -> critical when Guardian evidence is verified critical", () => {
+    const evidenceById = new Map([
+      [
+        "ev-form",
+        verifiedFormEvidence({ metadata: { severity: "critical", verification: "verified" } })
+      ]
+    ]);
+    const finding = calFinding({ severity: "optional", evidenceIds: ["ev-form"] });
+    const [result] = applySeverityFloor([finding], evidenceById);
+    expect(result.severity).toBe("critical");
+  });
+
+  it("leaves severity unchanged when the AI already matches the Guardian floor", () => {
+    const evidenceById = new Map([["ev-form", verifiedFormEvidence()]]);
+    const finding = calFinding({
+      severity: "important",
+      priority: 2,
+      evidenceIds: ["ev-form"]
+    });
+    const [result] = applySeverityFloor([finding], evidenceById);
+    expect(result.severity).toBe("important");
+    expect(result.priority).toBe(2);
+  });
+
+  it("never lowers a severity the AI reported above the floor", () => {
+    const evidenceById = new Map([["ev-form", verifiedFormEvidence()]]);
+    const finding = calFinding({ severity: "critical", evidenceIds: ["ev-form"] });
+    const [result] = applySeverityFloor([finding], evidenceById);
+    expect(result.severity).toBe("critical");
+  });
+
+  it("leaves AI severity unchanged when there is no Guardian deterministic evidence at all", () => {
+    const contentEvidence = guardianEvidence({
+      id: "ev-content",
+      collector: "reelscan-v1@content-evidence",
+      metadata: { verification: "verified" }
+    });
+    const evidenceById = new Map([["ev-content", contentEvidence]]);
+    const finding = calFinding({ severity: "optional", evidenceIds: ["ev-content"] });
+    const [result] = applySeverityFloor([finding], evidenceById);
+    expect(result.severity).toBe("optional");
+  });
+
+  it("never raises severity from inference-only Guardian evidence", () => {
+    // guardianEvidence() defaults to optional/inference (the responsive
+    // disclaimer) — inference evidence must never become a floor.
+    const evidenceById = new Map([["ev-responsive", guardianEvidence()]]);
+    const finding = calFinding({
+      severity: "optional",
+      evidenceIds: ["ev-responsive"]
+    });
+    const [result] = applySeverityFloor([finding], evidenceById);
+    expect(result.severity).toBe("optional");
+  });
+
+  it("does not touch notes or strengths", () => {
+    const evidenceById = new Map([["ev-form", verifiedFormEvidence()]]);
+    const note = calFinding({
+      kind: "note",
+      severity: "optional",
+      evidenceIds: ["ev-form"]
+    });
+    const strength = calFinding({
+      kind: "strength",
+      severity: "optional",
+      evidenceIds: ["ev-form"]
+    });
+    const [resultNote] = applySeverityFloor([note], evidenceById);
+    const [resultStrength] = applySeverityFloor([strength], evidenceById);
+    expect(resultNote.severity).toBe("optional");
+    expect(resultStrength.severity).toBe("optional");
+  });
+
+  it("normalizes a contradictory priority (5) to be consistent with the raised severity, minimally", () => {
+    const evidenceById = new Map([["ev-form", verifiedFormEvidence()]]);
+    const finding = calFinding({ severity: "optional", priority: 5, evidenceIds: ["ev-form"] });
+    const [result] = applySeverityFloor([finding], evidenceById);
+    expect(result.severity).toBe("important");
+    expect(result.priority).toBeLessThanOrEqual(2);
+  });
+
+  it("applies the floor after consolidating FR + AR duplicates, so it scores once at the raised severity", () => {
+    const fr = verifiedFormEvidence({ id: "ev-form-fr", sourceUrl: "https://reelhaus.de/fr/" });
+    const ar = verifiedFormEvidence({ id: "ev-form-ar", sourceUrl: "https://reelhaus.de/ar/" });
+    const evidenceById = new Map([
+      [fr.id, fr],
+      [ar.id, ar]
+    ]);
+    const raw = [
+      calFinding({ severity: "optional", priority: 5, evidenceIds: [fr.id] }),
+      calFinding({ severity: "optional", priority: 5, evidenceIds: [ar.id] })
+    ];
+    const consolidated = consolidateFindings(raw, evidenceById);
+    expect(consolidated).toHaveLength(1);
+    const floored = applySeverityFloor(consolidated, evidenceById);
+    expect(floored).toHaveLength(1);
+    expect(floored[0].severity).toBe("important");
+    expect(floored[0].evidenceIds.slice().sort()).toEqual([fr.id, ar.id].sort());
+
+    const persisted = floored.map((candidate) => calRecord(candidate));
+    const score = calculateReelScanScore(persisted);
+    expect(score.score).toBe(100 - REELSCAN_SEVERITY_DEDUCTIONS.important);
+  });
+
+  it("the raised severity is what scoring sees, not the AI's original optional", () => {
+    const evidenceById = new Map([["ev-form", verifiedFormEvidence()]]);
+    const finding = calFinding({ severity: "optional", evidenceIds: ["ev-form"] });
+    const [floored] = applySeverityFloor([finding], evidenceById);
+    const persisted = calRecord(floored);
+    expect(persisted.scoreImpact).toBe(-REELSCAN_SEVERITY_DEDUCTIONS.important);
+    expect(calculateReelScanScore([persisted]).score).toBe(
+      100 - REELSCAN_SEVERITY_DEDUCTIONS.important
+    );
+  });
+
+  it("the raised severity is what the recommendation sees — Fix, not no_immediate_change", () => {
+    const evidenceById = new Map([["ev-form", verifiedFormEvidence()]]);
+    const finding = calFinding({
+      category: "action_path",
+      severity: "optional",
+      evidenceIds: ["ev-form"]
+    });
+    const [floored] = applySeverityFloor([finding], evidenceById);
+    const persisted = [calRecord(floored)];
+    expect(recommendReelScanAction(persisted).action).toBe("ReelFix");
+  });
+
+  it("deriveDeterministicFindings already uses Guardian severity directly, unaffected by this change", () => {
+    const derived = deriveDeterministicFindings([verifiedFormEvidence()], new Set());
+    expect(derived).toHaveLength(1);
+    expect(derived[0].severity).toBe("important");
   });
 });
