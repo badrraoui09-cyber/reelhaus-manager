@@ -1,5 +1,6 @@
 import { Agent } from "agents";
 import { checkAiHealth } from "./ai-service";
+import { AuditLedgerService, SqlAuditLedgerStore } from "./audit-ledger";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
 import {
   BusinessAssistantAgent,
@@ -143,8 +144,13 @@ function validateLeadInput(input: LeadInput): string | null {
 }
 
 export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
+  private readonly auditLedger: AuditLedgerService;
+
   constructor(ctx: DurableObjectState, env: SalesEnv) {
     super(ctx, env);
+    this.auditLedger = new AuditLedgerService(
+      new SqlAuditLedgerStore(this.ctx.storage.sql)
+    );
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS reports (
         id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
@@ -358,6 +364,13 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
         return await this.runGuardianScan();
       if (request.method === "GET" && url.pathname === "/ai/health")
         return await this.aiHealthCheck();
+      if (
+        request.method === "GET" &&
+        /^\/audit\/scans\/[^/]+$/.test(url.pathname)
+      )
+        return json(
+          this.auditLedger.getScanAuditTrail(url.pathname.split("/")[3])
+        );
       if (request.method === "GET" && url.pathname === "/reports")
         return this.listReports();
       if (request.method === "GET" && url.pathname.startsWith("/reports/"))
