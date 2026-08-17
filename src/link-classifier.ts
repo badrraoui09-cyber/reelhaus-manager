@@ -3,7 +3,7 @@
 // Only a link classified as an ordinary "website" may ever become a
 // ReelScan fetch target — Instagram/Google Maps/other links are stored as
 // request context only and are never fetched or analyzed in ReelScan v1.
-import { validatePublicScanUrl } from "./url-safety";
+import { type UrlSafetyRejectionReason, validatePublicScanUrl } from "./url-safety";
 
 export type SubmittedLinkKind =
   | "website"
@@ -18,7 +18,26 @@ export interface ClassifiedLink {
   raw?: string;
   /** Only set when kind === "website" and the URL passed SSRF validation. */
   normalizedUrl?: string;
+  /**
+   * Set only when the submitted value clearly parses as a URL but fails
+   * SSRF safety for a reason serious enough that the whole request should
+   * be rejected rather than silently downgraded to a harmless
+   * "other_reference" — a private/reserved hostname or IP (127.0.0.1,
+   * localhost, 169.254.169.254, 10.x, [::1], ...) or credentials embedded
+   * in the URL. Never persisted and never exposed publicly — the caller
+   * (PublicIntakeService) maps this straight to a generic invalid_request
+   * rejection before any record is stored. A merely malformed/unsupported-
+   * protocol/too-long value is NOT treated this way: that's indistinguishable
+   * from a customer pasting free text and still becomes other_reference.
+   */
+  rejectedAsUnsafe?: true;
 }
+
+const SSRF_REJECT_REASONS: ReadonlySet<UrlSafetyRejectionReason> = new Set([
+  "private_or_reserved_hostname",
+  "private_or_reserved_ip",
+  "credentials_in_url"
+]);
 
 const INSTAGRAM_HOSTS = new Set(["instagram.com", "www.instagram.com"]);
 const GOOGLE_MAPS_HOSTS = new Set([
@@ -58,7 +77,11 @@ export function classifySubmittedLink(link: unknown): ClassifiedLink {
   }
 
   const validation = validatePublicScanUrl(raw);
-  if (!validation.ok) return { kind: "other_reference", raw };
+  if (!validation.ok) {
+    if (SSRF_REJECT_REASONS.has(validation.reason))
+      return { kind: "other_reference", raw, rejectedAsUnsafe: true };
+    return { kind: "other_reference", raw };
+  }
 
   return { kind: "website", raw, normalizedUrl: validation.url };
 }

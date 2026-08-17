@@ -304,4 +304,103 @@ describe("handlePublicReelScanRequest — success and error response contracts",
       error: "rate_limited"
     });
   });
+
+  it("rejects an explicit unsafe target URL as a generic invalid_request, storing nothing", async () => {
+    const request = jsonRequest({
+      ...VALID_BODY,
+      link: "https://169.254.169.254/latest/meta-data/"
+    });
+    const response = await handlePublicReelScanRequest(request, baseDeps());
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ ok: false, error: "invalid_request" });
+  });
+});
+
+describe("handlePublicReelScanRequest — public error containment (Task #5A-fix §1)", () => {
+  it("never leaks an unexpected store exception's message to the public caller", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest = () => {
+      throw new Error("SQLITE_CONSTRAINT inbound_requests secret_internal_detail");
+    };
+    const request = jsonRequest(VALID_BODY);
+    const response = await handlePublicReelScanRequest(
+      request,
+      baseDeps({ store })
+    );
+    const text = await response.text();
+    expect(response.status).toBe(503);
+    expect(text).not.toContain("SQLITE_CONSTRAINT");
+    expect(text).not.toContain("secret_internal_detail");
+    expect(JSON.parse(text)).toEqual({ ok: false, error: "try_again_later" });
+  });
+
+  it("never leaks an unexpected audit-ledger exception's message to the public caller", async () => {
+    const auditLedger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    auditLedger.recordEvidence = () => {
+      throw new Error("internal audit ledger corruption: table findings_v2 missing column");
+    };
+    const request = jsonRequest({
+      ...VALID_BODY,
+      link: "https://lepetitcafe.example/"
+    });
+    const response = await handlePublicReelScanRequest(
+      request,
+      baseDeps({ auditLedger })
+    );
+    const text = await response.text();
+    // A scan-pipeline exception is caught inside PublicIntakeService.submit()
+    // itself and still resolves to the normal accepted response — this test
+    // exists to prove that even if it somehow escaped, the boundary would
+    // still never leak detail. Assert on content, not status, since either
+    // outcome (200 accepted, or 503 fail-closed) is safe as long as nothing
+    // leaks.
+    expect(text).not.toContain("findings_v2");
+    expect(text).not.toContain("corruption");
+    const payload = JSON.parse(text);
+    if (payload.ok === false) expect(payload.error).toBe("try_again_later");
+  });
+
+  it("never leaks a thrown detailed error from deep inside the submit pipeline", async () => {
+    const ai = fakeAi(async () => {
+      throw new Error("Detailed provider stack trace: token=sk-secret-abc123");
+    });
+    const request = jsonRequest({
+      ...VALID_BODY,
+      link: "https://lepetitcafe.example/"
+    });
+    const response = await handlePublicReelScanRequest(
+      request,
+      baseDeps({ ai })
+    );
+    const text = await response.text();
+    expect(text).not.toContain("sk-secret-abc123");
+    expect(text).not.toContain("stack trace");
+  });
+});
+
+describe("handlePublicReelScanRequest — pre-Turnstile attempt limit (Task #5A-fix §5)", () => {
+  it("rate-limits repeated verification attempts before ever reaching an accepted-request rejection", async () => {
+    // Fails Turnstile every time, so these never consume the (much lower)
+    // accepted-request budget — only the separate, looser pre-Turnstile
+    // attempt counter.
+    const deps = baseDeps({ fetcher: combinedFetcher(false) });
+    let lastResponse: Response | undefined;
+    for (let i = 0; i < 21; i++)
+      lastResponse = await handlePublicReelScanRequest(jsonRequest(VALID_BODY), deps);
+    expect(lastResponse!.status).toBe(429);
+    expect(await lastResponse!.json()).toEqual({ ok: false, error: "rate_limited" });
+  });
+
+  it("keeps the pre-Turnstile attempt counter independent of the accepted-request counter", async () => {
+    const deps = baseDeps();
+    // 3 successful, accepted submissions (the accepted-request limit)...
+    for (let i = 0; i < 3; i++)
+      await handlePublicReelScanRequest(jsonRequest(VALID_BODY), deps);
+    // ...still leaves headroom on the separate, looser verification-attempt
+    // counter — a 4th attempt fails for the accepted-request reason, not
+    // because the attempt counter was secretly shared/exhausted early.
+    const fourth = await handlePublicReelScanRequest(jsonRequest(VALID_BODY), deps);
+    expect(await fourth.json()).toEqual({ ok: false, error: "rate_limited" });
+    expect(fourth.status).toBe(429);
+  });
 });

@@ -495,6 +495,17 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
         path: url.pathname,
         error: message(error)
       });
+      // Defense layer two for the public route: handlePublicReelScanRequest()
+      // already catches everything it can throw and always returns the
+      // generic public error contract itself (see public-intake-route.ts).
+      // This branch exists only in case that layer is ever bypassed —
+      // e.g. a bug introduced above this line, before dispatch even reaches
+      // it — so the public path can never fall through to this catch's
+      // normal { error: message(error) } shape, which is private-diagnostic
+      // by design and would leak internal detail if it reached a public
+      // caller.
+      if (url.pathname === "/public-intake/submit")
+        return json({ ok: false, error: "try_again_later" }, 503);
       return json({ error: message(error) }, 500);
     }
   }

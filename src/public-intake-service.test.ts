@@ -164,6 +164,34 @@ describe("PublicIntakeService.submit — link handling", () => {
     expect(stored.linkKind).toBe("other_reference");
     expect(stored.requestStatus).toBe("needs_target_review");
   });
+
+  // Task #5A-fix §4: distinct from the merely-unsupported-protocol case
+  // above — an explicit unsafe website URL (private/reserved hostname or
+  // IP) rejects the whole request before anything is stored, rather than
+  // silently downgrading to a harmless reference.
+  it("rejects the entire request as invalid_request for an explicit unsafe target URL, storing nothing", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    let fetchCalled = false;
+    const service = new PublicIntakeService({
+      store,
+      auditLedger: ledger,
+      ai: successfulAi(),
+      fetcher: (async () => {
+        fetchCalled = true;
+        return new Response("", { status: 200 });
+      }) as unknown as typeof fetch
+    });
+
+    const outcome = await service.submit(
+      baseRequest({ link: "https://169.254.169.254/latest/meta-data/" }),
+      "caller-1",
+      null
+    );
+    expect(outcome).toMatchObject({ accepted: false, reason: "invalid_request" });
+    expect(fetchCalled).toBe(false);
+    expect(store.listRequests(10)).toHaveLength(0);
+  });
 });
 
 describe("PublicIntakeService.submit — abuse/cost controls", () => {

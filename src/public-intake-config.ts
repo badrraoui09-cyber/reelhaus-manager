@@ -11,6 +11,25 @@ export const PUBLIC_RATE_LIMIT = {
   windowSeconds: 60 * 60 // 1 hour
 } as const;
 
+/**
+ * A separate, looser limit on syntactically-valid attempts that reach
+ * Turnstile's siteverify — evaluated BEFORE Turnstile is called, so an
+ * attacker with fake tokens can't force unlimited siteverify calls just
+ * because every one of them fails verification. Deliberately more
+ * permissive than PUBLIC_RATE_LIMIT: it exists to bound verification
+ * traffic, not to gate legitimate submissions (a real customer occasionally
+ * mistyping/retrying should never hit this before they hit the accepted-
+ * request limit above). Same pseudonymous caller-key, a distinct storage
+ * key namespace (see VERIFICATION_ATTEMPT_KEY_PREFIX) so it never shares a
+ * counter with the accepted-intake window.
+ */
+export const PRE_TURNSTILE_ATTEMPT_LIMIT = {
+  maxAttemptsPerWindow: 20,
+  windowSeconds: 60 * 60 // 1 hour
+} as const;
+
+export const VERIFICATION_ATTEMPT_KEY_PREFIX = "verify-attempt:";
+
 /** Per-target-hostname cooldown — see normalizeScanTargetKey() in public-intake-store.ts. */
 export const TARGET_SCAN_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h
 

@@ -47,7 +47,7 @@ export function normalizeScanTargetKey(url: string): string {
 
 export type PublicIntakeOutcome =
   | { accepted: true; id: string }
-  | { accepted: false; reason: "rate_limited" };
+  | { accepted: false; reason: "rate_limited" | "invalid_request" };
 
 export interface PublicIntakeDeps {
   store: PublicIntakeStore;
@@ -84,6 +84,12 @@ export class PublicIntakeService {
     store.purgeStaleRateLimitWindows(nowSeconds, PUBLIC_RATE_LIMIT.windowSeconds);
 
     const link = classifySubmittedLink(input.link);
+    // An explicit unsafe target (private/reserved hostname or IP,
+    // credentials in the URL) rejects the whole request before anything is
+    // stored — distinct from a harmless non-website reference (Instagram,
+    // Google Maps, random text), which is accepted as context. See
+    // link-classifier.ts and docs/reelscan-public-intake-security.md §11.
+    if (link.rejectedAsUnsafe) return { accepted: false, reason: "invalid_request" };
     const scanTargetKey =
       link.kind === "website" && link.normalizedUrl
         ? normalizeScanTargetKey(link.normalizedUrl)

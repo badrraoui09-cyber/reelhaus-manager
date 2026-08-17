@@ -24,6 +24,11 @@ import {
   type FindingKind,
   type FindingRecord
 } from "./audit-ledger";
+import {
+  GENERIC_CHECKS_COLLECTOR,
+  genericHtmlChecks,
+  technicalEvidenceFromGenericFindings
+} from "./generic-website-checks";
 import { safeFetchPublicUrl } from "./safe-fetch";
 import type { EvidenceConfidence } from "./sales-types";
 import { validatePublicScanUrl } from "./url-safety";
@@ -378,6 +383,15 @@ export function technicalEvidenceFromGuardianReport(
 }
 
 const GUARDIAN_COLLECTOR = "website-analysis@analyzeReelHaus";
+// Both collectors produce the same kind of deterministic, verified
+// structural defect (severity + verification metadata) — one scoped to
+// reelhaus.de's own Client #0 pages, one generic for any customer target.
+// The deterministic-injection and severity-floor guarantees below apply
+// equally to either, so both are treated as authoritative here.
+const DETERMINISTIC_EVIDENCE_COLLECTORS: ReadonlySet<string> = new Set([
+  GUARDIAN_COLLECTOR,
+  GENERIC_CHECKS_COLLECTOR
+]);
 
 function evidenceVerification(evidence: EvidenceRecord): EvidenceType {
   return evidence.metadata?.verification === "inference" ? "inference" : "verified";
@@ -678,7 +692,7 @@ function severityFloorFromEvidence(
   let floor: Severity | null = null;
   for (const id of evidenceIds) {
     const item = evidenceById.get(id);
-    if (!item || item.collector !== GUARDIAN_COLLECTOR) continue;
+    if (!item || !DETERMINISTIC_EVIDENCE_COLLECTORS.has(item.collector)) continue;
     if (evidenceVerification(item) !== "verified") continue;
     const severity = item.metadata?.severity as Severity | undefined;
     if (!severity) continue;
@@ -742,7 +756,7 @@ export function deriveDeterministicFindings(
 ): ValidatedReelScanFinding[] {
   const evidenceById = new Map(evidence.map((item) => [item.id, item]));
   const eligible = evidence.filter((item) => {
-    if (item.collector !== GUARDIAN_COLLECTOR) return false;
+    if (!DETERMINISTIC_EVIDENCE_COLLECTORS.has(item.collector)) return false;
     if (coveredEvidenceIds.has(item.id)) return false;
     if (evidenceVerification(item) !== "verified") return false;
     const severity = item.metadata?.severity as Severity | undefined;
@@ -1089,12 +1103,15 @@ export class ReelScanTargetError extends Error {
  * target is untrusted input: it is SSRF-validated, then fetched through
  * safe-fetch.ts (manual redirect handling, every hop re-validated, a
  * content-type allow-list, and a streamed byte cap) — never a raw fetch().
- * There is no Website Guardian equivalent for an arbitrary single-locale
- * customer site (that collector's checks — required FR/AR hreflang pairing,
- * RTL correctness — are reelhaus.de-specific), so evidence here is the same
- * factual content-evidence extraction Client #0 also uses, scoped to the
- * one validated page. Everything downstream (AI reasoning, validation,
- * calibration, scoring, recommendation) is identical via runReelScanV1Core.
+ * Website Guardian's ReelHaus-specific checks (required FR+AR hreflang
+ * pairing, RTL correctness, comparing <html lang> to an expected locale)
+ * do not apply to an arbitrary customer site and are intentionally not
+ * run here. Its generic structural checks (viewport, heading structure,
+ * alt text, accessible names, form labeling/naming, metadata) do apply to
+ * any site and are run via generic-website-checks.ts — over the HTML
+ * safeFetchPublicUrl() already retrieved, never a second network request.
+ * Everything downstream (AI reasoning, validation, calibration, scoring,
+ * recommendation) is identical via runReelScanV1Core.
  */
 export async function runReelScanV1Target(
   deps: ReelScanV1TargetDeps
@@ -1109,7 +1126,11 @@ export async function runReelScanV1Target(
   const scanId = crypto.randomUUID();
   const capturedAt = new Date().toISOString();
   const signals = extractContentSignals(fetchResult.finalUrl, fetchResult.html);
-  const evidenceInputs = contentEvidenceInputs(scanId, signals, capturedAt);
+  const genericFindings = genericHtmlChecks(fetchResult.finalUrl, fetchResult.html);
+  const evidenceInputs = [
+    ...contentEvidenceInputs(scanId, signals, capturedAt),
+    ...technicalEvidenceFromGenericFindings(scanId, genericFindings, capturedAt)
+  ];
 
   return runReelScanV1Core({
     scanId,

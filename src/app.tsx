@@ -17,6 +17,8 @@ import {
 import type { AuditReport, ReportSummary } from "./website-analysis";
 import { BusinessWorkspaceView } from "./business-workspace-view";
 import { Icon, type IconName } from "./ui-icons";
+import type { InboundRequestManagerView } from "./public-intake-service";
+import type { RequestStatus } from "./public-intake-store";
 
 interface SalesSnapshot {
   aiVersion: string;
@@ -79,6 +81,7 @@ type View =
   | "discovery"
   | "leads"
   | "audits"
+  | "inbound"
   | "email-review"
   | "pipeline"
   | "settings"
@@ -136,6 +139,13 @@ const VIEW_META: Record<
     icon: "guardian",
     group: "Intelligence"
   },
+  inbound: {
+    label: "Inbound ReelScan Requests",
+    shortLabel: "Inbound Requests",
+    description: "Öffentlich eingereichte ReelScan-Anfragen prüfen",
+    icon: "bell",
+    group: "Intelligence"
+  },
   "email-review": {
     label: "Email Review",
     shortLabel: "Email Review",
@@ -163,7 +173,7 @@ const NAV_GROUPS: Array<{ label: string; views: View[] }> = [
   { label: "Workspace", views: ["overview", "workspace"] },
   {
     label: "Intelligence",
-    views: ["discovery", "leads", "audits", "guardian"]
+    views: ["discovery", "leads", "audits", "guardian", "inbound"]
   },
   { label: "Operations", views: ["email-review", "pipeline"] },
   { label: "System", views: ["settings"] }
@@ -218,6 +228,28 @@ function discoveryStatusLabel(status: DiscoveryCandidate["status"]): string {
   }[status];
 }
 
+export function inboundStatusLabel(status: RequestStatus): string {
+  return {
+    received: "Received / waiting",
+    needs_target_review: "Needs target review",
+    scanning: "Scanning",
+    scan_ready_needs_review: "Needs review",
+    analysis_failed: "Analysis failed"
+  }[status];
+}
+
+export function inboundLinkLabel(
+  kind: InboundRequestManagerView["linkKind"]
+): string {
+  return {
+    website: "Website",
+    instagram: "Instagram",
+    google_maps: "Google Maps",
+    other_reference: "Other reference",
+    none: "None"
+  }[kind];
+}
+
 function Summary({ summary }: { summary: ReportSummary }) {
   return (
     <div className="summary">
@@ -247,6 +279,11 @@ export default function App() {
   const globalSearchRef = useRef<HTMLInputElement>(null);
   const [sales, setSales] = useState<SalesSnapshot | null>(null);
   const [report, setReport] = useState<AuditReport | null>(null);
+  const [inboundRequests, setInboundRequests] = useState<
+    InboundRequestManagerView[] | null
+  >(null);
+  const [inboundLoading, setInboundLoading] = useState(false);
+  const [inboundError, setInboundError] = useState("");
   const [assistantOutput, setAssistantOutput] =
     useState<BusinessAssistantOutput | null>(null);
   const [busy, setBusy] = useState(false);
@@ -330,6 +367,26 @@ export default function App() {
   useEffect(() => {
     void loadSales();
   }, [loadSales]);
+
+  const loadInboundRequests = useCallback(async () => {
+    setInboundLoading(true);
+    setInboundError("");
+    try {
+      setInboundRequests(
+        await api<InboundRequestManagerView[]>("/api/inbound-requests")
+      );
+    } catch (caught) {
+      setInboundError(
+        caught instanceof Error ? caught.message : "Abruf fehlgeschlagen"
+      );
+    } finally {
+      setInboundLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    if (view === "inbound") void loadInboundRequests();
+  }, [view, loadInboundRequests]);
 
   useEffect(() => {
     function handleShortcut(event: KeyboardEvent) {
@@ -1765,6 +1822,113 @@ export default function App() {
                     </article>
                   ))}
                 </>
+              )}
+            </section>
+          )}
+
+          {view === "inbound" && (
+            <section className="panel">
+              <div className="section-heading">
+                <div>
+                  <h2>Inbound ReelScan Requests</h2>
+                  <p className="muted">
+                    Öffentlich eingereichte Anfragen — nie automatisch zu
+                    Discovery, CRM oder Outreach konvertiert. Jede
+                    abgeschlossene Analyse braucht eine manuelle
+                    Freigabeprüfung.
+                  </p>
+                </div>
+                <button
+                  className="secondary"
+                  disabled={inboundLoading}
+                  onClick={() => void loadInboundRequests()}
+                >
+                  Refresh
+                </button>
+              </div>
+              {inboundError && <p className="error">{inboundError}</p>}
+              {inboundLoading && !inboundRequests && (
+                <Empty>Anfragen werden geladen…</Empty>
+              )}
+              {inboundRequests && inboundRequests.length === 0 && (
+                <Empty>Noch keine eingereichten ReelScan-Anfragen.</Empty>
+              )}
+              {!!inboundRequests?.length && (
+                <div className="table-wrap">
+                  <table className="discovery-table">
+                    <thead>
+                      <tr>
+                        <th>Business</th>
+                        <th>Customer</th>
+                        <th>City</th>
+                        <th>Contact</th>
+                        <th>Support need</th>
+                        <th>Submitted link</th>
+                        <th>Language</th>
+                        <th>Received</th>
+                        <th>Status</th>
+                        <th>Score / Recommendation</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {inboundRequests.map((item) => (
+                        <tr key={item.id}>
+                          <td>
+                            <strong>{item.businessName}</strong>
+                          </td>
+                          <td>{item.name}</td>
+                          <td>{item.city}</td>
+                          <td>
+                            {item.email && <div>{item.email}</div>}
+                            {item.whatsapp && <div>{item.whatsapp}</div>}
+                            {!item.email && !item.whatsapp && (
+                              <span className="muted">—</span>
+                            )}
+                          </td>
+                          <td>{item.supportNeed}</td>
+                          <td>
+                            {item.submittedLink ? (
+                              <>
+                                <span>{inboundLinkLabel(item.linkKind)}</span>
+                                <small className="candidate-meta">
+                                  {item.submittedLink}
+                                </small>
+                              </>
+                            ) : (
+                              <span className="muted">
+                                {inboundLinkLabel(item.linkKind)}
+                              </span>
+                            )}
+                          </td>
+                          <td>{item.language.toUpperCase()}</td>
+                          <td>
+                            {new Date(item.createdAt).toLocaleString()}
+                          </td>
+                          <td>
+                            <span
+                              className={`discovery-status inbound-status ${item.requestStatus}`}
+                            >
+                              {inboundStatusLabel(item.requestStatus)}
+                            </span>
+                          </td>
+                          <td>
+                            {item.requestStatus === "scan_ready_needs_review" &&
+                            item.score !== undefined ? (
+                              <>
+                                <strong>{item.score}/100</strong>
+                                <small className="candidate-meta">
+                                  {item.recommendation}
+                                </small>
+                              </>
+                            ) : (
+                              <span className="muted">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </section>
           )}

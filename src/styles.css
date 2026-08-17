@@ -468,6 +468,26 @@ textarea {
   color: #5f6260;
   background: #e9ebe9;
 }
+.inbound-status.received {
+  color: #2c5876;
+  background: #e3f1fb;
+}
+.inbound-status.needs_target_review {
+  color: #87520b;
+  background: #fff0d2;
+}
+.inbound-status.scanning {
+  color: #87520b;
+  background: #fff0d2;
+}
+.inbound-status.scan_ready_needs_review {
+  color: #145634;
+  background: #ccebd8;
+}
+.inbound-status.analysis_failed {
+  color: #8a1825;
+  background: #fee8eb;
+}
 .pilot-label {
   display: inline-flex;
   align-items: center;
