@@ -115,6 +115,19 @@ export interface PublicIntakeStore {
    */
   recoverStaleScanningRows(nowIso: string, maxAgeMs: number): void;
 
+  /**
+   * Whether any (non-stale) "scanning" row exists, anywhere — not scoped
+   * to a target. Task #5A-fix round 4 §2: a row can be freshly "scanning"
+   * (from a scheduled callback that started it but was then interrupted/
+   * reset before reaching a terminal status) while listQueuedForScan()
+   * is empty. That row is genuine unresolved work — it isn't stale enough
+   * for recoverStaleScanningRows() to touch yet, but a future pass still
+   * needs to exist to eventually recover it if it never completes.
+   * processQueue() ORs this into its "does the caller need to re-arm a
+   * future pass" decision so that scenario is never silently dropped.
+   */
+  hasActiveScanningWork(nowIso: string, maxAgeMs: number): boolean;
+
   /** Oldest-first, bounded — the intake queue's work list for one pass. */
   listQueuedForScan(limit: number): InboundRequestRecord[];
 
@@ -223,6 +236,15 @@ export class InMemoryPublicIntakeStore implements PublicIntakeStore {
         });
       }
     }
+  }
+
+  hasActiveScanningWork(nowIso: string, maxAgeMs: number): boolean {
+    const nowMs = Date.parse(nowIso);
+    return [...this.requests.values()].some(
+      (record) =>
+        record.requestStatus === "scanning" &&
+        nowMs - Date.parse(record.updatedAt) <= maxAgeMs
+    );
   }
 
   listQueuedForScan(limit: number): InboundRequestRecord[] {
@@ -526,6 +548,19 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
       nowIso,
       cutoffIso
     );
+  }
+
+  hasActiveScanningWork(nowIso: string, maxAgeMs: number): boolean {
+    const cutoffIso = new Date(Date.parse(nowIso) - maxAgeMs).toISOString();
+    const row = this.sql
+      .exec<{ found: number }>(
+        `SELECT 1 AS found FROM inbound_requests
+         WHERE request_status = 'scanning' AND updated_at > ?
+         LIMIT 1`,
+        cutoffIso
+      )
+      .toArray()[0];
+    return Boolean(row);
   }
 
   listQueuedForScan(limit: number): InboundRequestRecord[] {

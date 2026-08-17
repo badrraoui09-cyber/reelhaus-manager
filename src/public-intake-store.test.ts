@@ -327,6 +327,42 @@ describe("InMemoryPublicIntakeStore — recoverStaleScanningRows (Task #5A-fix r
   });
 });
 
+describe("InMemoryPublicIntakeStore — hasActiveScanningWork (Task #5A-fix round 4 §2)", () => {
+  it("reports true while a fresh scanning row exists", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        requestStatus: "scanning",
+        updatedAt: "2026-08-17T09:59:30.000Z" // 30s old
+      })
+    );
+    expect(store.hasActiveScanningWork("2026-08-17T10:00:00.000Z", 120_000)).toBe(
+      true
+    );
+  });
+
+  it("reports false once the only scanning row is stale", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        requestStatus: "scanning",
+        updatedAt: "2026-08-17T09:00:00.000Z" // 1h old
+      })
+    );
+    expect(store.hasActiveScanningWork("2026-08-17T10:00:00.000Z", 120_000)).toBe(
+      false
+    );
+  });
+
+  it("reports false when nothing is scanning", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(record({ requestStatus: "queued_for_scan" }));
+    expect(store.hasActiveScanningWork("2026-08-17T10:00:00.000Z", 120_000)).toBe(
+      false
+    );
+  });
+});
+
 describe("InMemoryPublicIntakeStore — intake queue listing", () => {
   it("lists queued_for_scan requests oldest first", () => {
     const store = new InMemoryPublicIntakeStore();

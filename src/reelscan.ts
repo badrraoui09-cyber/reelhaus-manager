@@ -29,6 +29,7 @@ import {
   genericHtmlChecks,
   technicalEvidenceFromGenericFindings
 } from "./generic-website-checks";
+import { PUBLIC_TARGET_FETCH_TIMEOUT_MS } from "./public-intake-config";
 import { safeFetchPublicUrl } from "./safe-fetch";
 import type { EvidenceConfidence } from "./sales-types";
 import { validatePublicScanUrl } from "./url-safety";
@@ -1144,7 +1145,9 @@ export async function runReelScanV1Target(
   if (!validated.ok)
     throw new ReelScanTargetError(`unsafe_url:${validated.reason}`);
 
-  const fetchResult = await safeFetchPublicUrl(deps.fetcher, validated.url);
+  const fetchResult = await safeFetchPublicUrl(deps.fetcher, validated.url, {
+    totalTimeoutMs: PUBLIC_TARGET_FETCH_TIMEOUT_MS
+  });
   if (!fetchResult.ok) throw new ReelScanTargetError(fetchResult.reason);
 
   const scanId = crypto.randomUUID();

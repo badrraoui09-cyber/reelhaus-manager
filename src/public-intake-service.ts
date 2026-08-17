@@ -226,8 +226,18 @@ export class PublicIntakeService {
    *  - otherwise it competes for a global concurrency slot exactly as
    *    before, and is skipped (left queued) if capacity is full.
    *
-   * Returns whether any queued work remains, so the caller (the Durable
-   * Object's scheduled callback) knows whether to re-arm.
+   * Returns whether the caller (the Durable Object's scheduled callback)
+   * needs to re-arm a future pass — true when EITHER queued_for_scan rows
+   * remain OR a non-stale "scanning" row exists anywhere (Task #5A-fix
+   * round 4 §2). The second case matters even though this method's own
+   * work always resolves each row it reserves to a terminal state before
+   * returning: a *previous*, externally-interrupted pass (the scheduled
+   * callback itself was killed/reset mid-scan by the platform) can leave
+   * a row genuinely, freshly "scanning" — not yet stale enough for
+   * recoverStaleScanningRows() to touch, and therefore invisible to
+   * listQueuedForScan() too. Reporting only "queued work remains" would
+   * silently drop that row: no future pass would ever be scheduled to
+   * eventually recover it once it does go stale.
    */
   async processQueue(
     nowMs: number,
@@ -348,7 +358,17 @@ export class PublicIntakeService {
       }
     }
 
-    return { remainingQueued: store.listQueuedForScan(1).length > 0 };
+    // Freshly computed "now" — not the stale nowIso from function entry —
+    // since real scan work above may have taken up to the full bounded
+    // scan runtime, and a row could have gone from fresh to stale during
+    // that time.
+    const finishedNowIso = new Date().toISOString();
+    const hasQueuedWork = store.listQueuedForScan(1).length > 0;
+    const hasFreshScanningWork = store.hasActiveScanningWork(
+      finishedNowIso,
+      SCAN_RESERVATION_MAX_AGE_MS
+    );
+    return { remainingQueued: hasQueuedWork || hasFreshScanningWork };
   }
 }
 

@@ -50,17 +50,72 @@ export const FAILED_SCAN_RETRY_BACKOFF_MS = 10 * 60 * 1000; // 10 minutes
 
 export const MAX_CONCURRENT_PUBLIC_SCANS = 2;
 
+// -- Task #5A-fix round 4 §1/§4 — the queue-processing timing invariant --
+//
+// A legitimate scan runs entirely inside one Agent scheduled callback
+// (sales-agent.ts's processInboundScanQueue -> PublicIntakeService.
+// processQueue -> runReelScanV1Target), so every timeout in that chain
+// must nest strictly inside the next:
+//
+//   PUBLIC_TARGET_FETCH_TIMEOUT_MS         (20s  — safe-fetch total budget)
+//   + REELSCAN_AI_TIMEOUT_MS               (60s  — reelscan.ts, UNCHANGED)
+//   + QUEUE_PROCESSING_MARGIN_MS           (10s  — evidence/scoring/persist)
+//   = 90s  bounded legitimate scan runtime
+//   <
+//   AGENT_HUNG_SCHEDULE_TIMEOUT_SECONDS    (120s — sales-agent.ts static options)
+//   <
+//   SCAN_RESERVATION_MAX_AGE_MS            (180s — this file)
+//
+// Each step has real headroom (30s) rather than being pinned to the exact
+// sum, so normal jitter (GC pauses, a slightly slow evidence pass) can't
+// tip a legitimate scan into either bucket meant for genuinely stuck work.
+// docs: this whole chain is exercised by a dedicated test in
+// public-intake-config.test.ts that fails loudly if any of these five
+// numbers drift out of the required order — see that file before changing
+// any of them.
+
+/**
+ * Total wall-clock budget for fetching ONE public customer target through
+ * safe-fetch.ts — covers the initial connection, every redirect hop, AND
+ * streaming the final response body (a slow/stalled body after headers
+ * arrive is bounded exactly like a slow initial connection; see
+ * safe-fetch.ts). Passed explicitly as runReelScanV1Target's
+ * safeFetchPublicUrl({ totalTimeoutMs }) call in reelscan.ts.
+ */
+export const PUBLIC_TARGET_FETCH_TIMEOUT_MS = 20_000; // 20s
+
+/**
+ * Margin added on top of (fetch + AI) for the deterministic work around
+ * them — generic-website-checks.ts's regex extraction, evidence
+ * recording, consolidation/severity-floor/scoring, and the store writes
+ * that persist the outcome. All of that is fast in practice; this is
+ * deliberately generous headroom, not a measured worst case.
+ */
+export const QUEUE_PROCESSING_MARGIN_MS = 10_000; // 10s
+
+/**
+ * Configures ReelHausManager's `static options.hungScheduleTimeoutSeconds`
+ * (sales-agent.ts) — the agents SDK's default (30s) is well under a
+ * legitimate scan's ~90s bounded runtime and would let the SDK treat an
+ * in-progress, healthy scan as "hung." Must stay strictly greater than
+ * PUBLIC_TARGET_FETCH_TIMEOUT_MS + REELSCAN_AI_TIMEOUT_MS +
+ * QUEUE_PROCESSING_MARGIN_MS (90s) — see the invariant above.
+ */
+export const AGENT_HUNG_SCHEDULE_TIMEOUT_SECONDS = 120; // 2 minutes
+
 /**
  * A "scanning" reservation older than this is treated as stale and
- * released. Set comfortably above ReelScan's own REELSCAN_AI_TIMEOUT_MS
- * (60s) to allow for the target fetch and post-processing around it,
- * without letting a genuinely stuck request hold a concurrency slot
- * indefinitely. Also used to decide whether an in-flight "scanning" row
- * for the same target should block a duplicate scan (see
- * isTargetCurrentlyScanning in public-intake-store.ts) — a stale row
- * never blocks anything.
+ * recovered back to queued_for_scan (see recoverStaleScanningRows in
+ * public-intake-store.ts). Must stay strictly greater than
+ * AGENT_HUNG_SCHEDULE_TIMEOUT_SECONDS — otherwise a row could be reaped
+ * as "stale" while the Agent scheduler itself still considers the
+ * callback that's actively working on it healthy, permitting a second,
+ * duplicate scan of the same target to start concurrently. Also used to
+ * decide whether an in-flight "scanning" row for the same exact target
+ * should block a duplicate scan (see isTargetCurrentlyScanning) — a
+ * stale row never blocks anything.
  */
-export const SCAN_RESERVATION_MAX_AGE_MS = 2 * 60 * 1000; // 2 minutes
+export const SCAN_RESERVATION_MAX_AGE_MS = 3 * 60 * 1000; // 3 minutes
 
 /**
  * Intake queue (Task #5A-fix §5): how many queued_for_scan requests one

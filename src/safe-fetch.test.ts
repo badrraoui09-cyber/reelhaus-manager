@@ -156,3 +156,94 @@ describe("safeFetchPublicUrl", () => {
     if (!result.ok) expect(result.reason).toBe("redirect_missing_location");
   });
 });
+
+// -- Task #5A-fix round 4 §3 — the total deadline covers body streaming --
+describe("safeFetchPublicUrl — total wall-clock deadline", () => {
+  function stalledBodyResponse(): Response {
+    // Headers arrive instantly; the body stream never produces a chunk
+    // and never closes — simulates a hostile/buggy server that returns
+    // fast headers and then stalls, which a Content-Length/byte-cap check
+    // alone cannot detect (zero bytes never exceeds any cap).
+    const stream = new ReadableStream({
+      pull() {
+        return new Promise<void>(() => {
+          // deliberately never resolves
+        });
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/html" }
+    });
+  }
+
+  it("times out a body that stalls after headers arrive, as a stable fetch_timeout", async () => {
+    const fetcher = fakeFetcher(() => stalledBodyResponse());
+    const result = await safeFetchPublicUrl(fetcher, "https://example.com/", {
+      totalTimeoutMs: 20
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("fetch_timeout");
+  });
+
+  it("the timeout applies during body streaming, not merely around the initial fetch() call", async () => {
+    let headersArrived = false;
+    const fetcher = fakeFetcher(() => {
+      headersArrived = true;
+      return stalledBodyResponse();
+    });
+    const result = await safeFetchPublicUrl(fetcher, "https://example.com/", {
+      totalTimeoutMs: 20
+    });
+    // Headers DID arrive (the initial fetch() resolved fine) — the
+    // timeout only fired once the body read hung, proving it's not just
+    // a "time to first byte" guard.
+    expect(headersArrived).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("fetch_timeout");
+  });
+
+  it("does not leak the stalled-stream/provider detail — only the stable fetch_timeout code", async () => {
+    const fetcher = fakeFetcher(() => stalledBodyResponse());
+    const result = await safeFetchPublicUrl(fetcher, "https://example.com/", {
+      totalTimeoutMs: 20
+    });
+    expect(result).toEqual({ ok: false, reason: "fetch_timeout" });
+  });
+
+  it("a redirect chain draws from the SAME total deadline as the final fetch — does not reset per hop", async () => {
+    const HOP_DELAY_MS = 15;
+    const fetcher = (async (input: RequestInfo | URL) => {
+      await new Promise((resolve) => setTimeout(resolve, HOP_DELAY_MS));
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      if (url === "https://example.com/") return redirectResponse("/hop1");
+      if (url === "https://example.com/hop1") return redirectResponse("/hop2");
+      if (url === "https://example.com/hop2") return redirectResponse("/hop3");
+      return htmlResponse("<html>should never be reached</html>");
+    }) as typeof fetch;
+
+    // 3 hops * 15ms = 45ms of real work against a 30ms total budget — a
+    // per-hop timeout (the pre-fix design) would happily allow every
+    // individual 15ms hop and never time out; a shared total deadline
+    // must not.
+    const result = await safeFetchPublicUrl(fetcher, "https://example.com/", {
+      totalTimeoutMs: 30,
+      maxRedirects: 5
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("fetch_timeout");
+  });
+
+  it("still succeeds comfortably inside a generous total deadline", async () => {
+    const fetcher = fakeFetcher(() => htmlResponse("<html>ok</html>"));
+    const result = await safeFetchPublicUrl(fetcher, "https://example.com/", {
+      totalTimeoutMs: 5_000
+    });
+    expect(result.ok).toBe(true);
+  });
+});

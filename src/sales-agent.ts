@@ -2,7 +2,11 @@ import { Agent } from "agents";
 import { checkAiHealth } from "./ai-service";
 import { AuditLedgerService, SqlAuditLedgerStore } from "./audit-ledger";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
-import { QUEUE_BATCH_LIMIT, QUEUE_RETRY_DELAY_SECONDS } from "./public-intake-config";
+import {
+  AGENT_HUNG_SCHEDULE_TIMEOUT_SECONDS,
+  QUEUE_BATCH_LIMIT,
+  QUEUE_RETRY_DELAY_SECONDS
+} from "./public-intake-config";
 import { handlePublicReelScanRequest } from "./public-intake-route";
 import { PublicIntakeService, listInboundRequestsForManager } from "./public-intake-service";
 import { SqlPublicIntakeStore } from "./public-intake-store";
@@ -149,6 +153,16 @@ function validateLeadInput(input: LeadInput): string | null {
 }
 
 export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
+  // Task #5A-fix round 4 §1: the agents SDK's default
+  // hungScheduleTimeoutSeconds (30s) is well under a legitimate
+  // processInboundScanQueue scan's bounded ~90s runtime (target fetch +
+  // AI + processing margin — see the timing invariant documented in
+  // public-intake-config.ts, pinned by public-intake-config.test.ts) and
+  // would let the SDK treat a healthy, still-running scan as "hung."
+  static options = {
+    hungScheduleTimeoutSeconds: AGENT_HUNG_SCHEDULE_TIMEOUT_SECONDS
+  };
+
   private readonly auditLedger: AuditLedgerService;
   private readonly publicIntakeStore: SqlPublicIntakeStore;
 

@@ -455,6 +455,92 @@ describe("PublicIntakeService.processQueue — draining the queue", () => {
       "scan_ready_needs_review"
     );
   });
+
+  // Task #5A-fix round 4 §2 required regression: a hard interruption
+  // between "reserve a scanning slot" and "reach a terminal status" (the
+  // Agent scheduled callback itself was killed/reset by the platform, and
+  // the SDK's retry fires again seconds later — long before the row is
+  // stale) must not silently drop the row. This is deliberately DIFFERENT
+  // from the existing "STALE scanning row" tests above, which all start
+  // from an already-stale row; this one starts fresh.
+  it("a fresh (non-stale) scanning row with no queued work still reports remaining work, and is left untouched", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    const freshTime = new Date(Date.now() - 10_000).toISOString(); // 10s old — well under any stale threshold
+    store.insertRequest({
+      id: "mid-flight",
+      createdAt: freshTime,
+      updatedAt: freshTime,
+      name: "x",
+      businessName: "x",
+      city: "x",
+      supportNeed: "unknown",
+      email: "x@example.com",
+      linkKind: "website",
+      submittedLink: "https://lepetitcafe.example/",
+      scanTargetKey: "lepetitcafe.example",
+      scanReuseKey: "https://lepetitcafe.example/",
+      language: "fr",
+      requestStatus: "scanning",
+      privacyAcceptedAt: freshTime
+    });
+
+    let scanAttempts = 0;
+    const { service } = buildService({
+      store,
+      fetcher: (async () => {
+        scanAttempts++;
+        return new Response(SAFE_HTML, {
+          status: 200,
+          headers: { "content-type": "text/html" }
+        });
+      }) as unknown as typeof fetch
+    });
+
+    // First pass: no queued_for_scan rows exist at all — the only work is
+    // the fresh "scanning" row from the interrupted attempt.
+    const { remainingQueued } = await service.processQueue(Date.now(), 20);
+
+    expect(remainingQueued).toBe(true); // MUST require a future pass
+    expect(scanAttempts).toBe(0); // did not launch a redundant scan
+    expect(store.getRequest("mid-flight")!.requestStatus).toBe("scanning"); // left exactly as-is — not reset yet
+  });
+
+  it("a later pass recovers the row once it actually goes stale, and it reaches a terminal state", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    const t0 = Date.now();
+    const startTime = new Date(t0).toISOString();
+    store.insertRequest({
+      id: "mid-flight",
+      createdAt: startTime,
+      updatedAt: startTime,
+      name: "x",
+      businessName: "x",
+      city: "x",
+      supportNeed: "unknown",
+      email: "x@example.com",
+      linkKind: "website",
+      submittedLink: "https://lepetitcafe.example/",
+      scanTargetKey: "lepetitcafe.example",
+      scanReuseKey: "https://lepetitcafe.example/",
+      language: "fr",
+      requestStatus: "scanning",
+      privacyAcceptedAt: startTime
+    });
+
+    const { service } = buildService({ store, fetcher: websiteFetcher(SAFE_HTML) });
+
+    // Still fresh (10s in) — must not be touched.
+    const first = await service.processQueue(t0 + 10_000, 20);
+    expect(first.remainingQueued).toBe(true);
+    expect(store.getRequest("mid-flight")!.requestStatus).toBe("scanning");
+
+    // Now past SCAN_RESERVATION_MAX_AGE_MS (3 minutes) — recovered,
+    // reprocessed, and reaches a real terminal state in the SAME pass.
+    const second = await service.processQueue(t0 + 4 * 60 * 1000, 20);
+    const recovered = store.getRequest("mid-flight")!;
+    expect(recovered.requestStatus).toBe("scan_ready_needs_review");
+    expect(second.remainingQueued).toBe(false);
+  });
 });
 
 describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-fix round 3 §3)", () => {
