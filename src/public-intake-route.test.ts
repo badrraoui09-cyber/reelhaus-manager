@@ -377,6 +377,35 @@ describe("handlePublicReelScanRequest — public error containment (Task #5A-fix
     expect(text).not.toContain("sk-secret-abc123");
     expect(text).not.toContain("stack trace");
   });
+
+  // Task #5A-fix round 3 §1/§8: a schedule-creation failure must not
+  // produce a public accepted-success response, and must not leave the
+  // row permanently queued with no guaranteed future processing.
+  it("never returns ok:true when establishing durable queue processing fails, and leaks nothing", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    const request = jsonRequest({
+      ...VALID_BODY,
+      link: "https://lepetitcafe.example/"
+    });
+    const response = await handlePublicReelScanRequest(
+      request,
+      baseDeps({
+        store,
+        scheduleQueueProcessing: async () => {
+          throw new Error("internal scheduling detail — must never reach the caller");
+        }
+      })
+    );
+    const text = await response.text();
+    expect(response.status).toBe(503);
+    expect(JSON.parse(text)).toEqual({ ok: false, error: "try_again_later" });
+    expect(text).not.toContain("internal scheduling detail");
+
+    const rows = store.listRequests(10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].requestStatus).toBe("analysis_failed");
+    expect(store.listQueuedForScan(10)).toHaveLength(0);
+  });
 });
 
 describe("handlePublicReelScanRequest — pre-Turnstile attempt limit (Task #5A-fix §5)", () => {

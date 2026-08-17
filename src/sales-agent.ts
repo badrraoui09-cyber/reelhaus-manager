@@ -542,6 +542,15 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   // over a hand-rolled alarm() handler). idempotent:true means repeated
   // calls (once per accepted website submission) collapse onto the same
   // pending run instead of accumulating duplicate schedule rows.
+  //
+  // Deliberately no explicit `retry` override: the SDK's own default
+  // (3 attempts, exponential backoff — see the installed `agents`
+  // package's RetryOptions) is already reasonable for a same-process
+  // schedule-row write, and retry is a mitigation, not a fix — the actual
+  // guarantee that a schedule failure never strands a request lives in
+  // PublicIntakeService.submit() (round 3 §1: a failure here still throws
+  // after every retry is exhausted, moves the row to analysis_failed, and
+  // the public route maps that to a generic try_again_later).
   private async scheduleInboundScanQueue(): Promise<void> {
     await this.schedule(0, "processInboundScanQueue", undefined, { idempotent: true });
   }

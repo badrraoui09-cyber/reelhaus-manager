@@ -124,57 +124,94 @@ describe("InMemoryPublicIntakeStore — concurrency reservation", () => {
   });
 });
 
-describe("InMemoryPublicIntakeStore — target cooldown/reuse lookups (Task #5A-fix §6)", () => {
-  it("returns the most recent COMPLETED scan for a target, with its scanId", () => {
+describe("InMemoryPublicIntakeStore — target cooldown/reuse lookups (Task #5A-fix round 3 §3/§4)", () => {
+  it("returns the most recent COMPLETED scan for an exact scanReuseKey, using scan_completed_at", () => {
     const store = new InMemoryPublicIntakeStore();
     store.insertRequest(
       record({
         id: "a",
-        scanTargetKey: "lepetitcafe.example",
+        scanReuseKey: "https://lepetitcafe.example/",
         requestStatus: "scan_ready_needs_review",
         scanId: "scan-old",
-        createdAt: "2026-08-16T10:00:00.000Z"
+        createdAt: "2026-08-16T10:00:00.000Z",
+        scanCompletedAt: "2026-08-16T10:05:00.000Z"
       })
     );
     store.insertRequest(
       record({
         id: "b",
-        scanTargetKey: "lepetitcafe.example",
+        scanReuseKey: "https://lepetitcafe.example/",
         requestStatus: "scan_ready_needs_review",
         scanId: "scan-new",
-        createdAt: "2026-08-17T10:00:00.000Z"
+        createdAt: "2026-08-17T10:00:00.000Z",
+        scanCompletedAt: "2026-08-17T10:05:00.000Z"
       })
     );
-    expect(store.latestCompletedScanForTarget("lepetitcafe.example")).toEqual({
+    expect(
+      store.latestCompletedScanForTarget("https://lepetitcafe.example/")
+    ).toEqual({
       scanId: "scan-new",
-      createdAt: "2026-08-17T10:00:00.000Z"
+      completedAt: "2026-08-17T10:05:00.000Z"
     });
+  });
+
+  it("does not reuse a scan for a DIFFERENT path on the same hostname", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        scanReuseKey: "https://lepetitcafe.example/menu",
+        requestStatus: "scan_ready_needs_review",
+        scanId: "scan-menu",
+        scanCompletedAt: "2026-08-17T10:05:00.000Z"
+      })
+    );
+    expect(
+      store.latestCompletedScanForTarget("https://lepetitcafe.example/")
+    ).toBeNull();
   });
 
   it("does not treat a failed scan as a completed one to reuse", () => {
     const store = new InMemoryPublicIntakeStore();
     store.insertRequest(
       record({
-        scanTargetKey: "lepetitcafe.example",
+        scanReuseKey: "https://lepetitcafe.example/",
         requestStatus: "analysis_failed",
-        createdAt: "2026-08-17T10:00:00.000Z"
+        scanFailedAt: "2026-08-17T10:00:00.000Z"
       })
     );
-    expect(store.latestCompletedScanForTarget("lepetitcafe.example")).toBeNull();
+    expect(
+      store.latestCompletedScanForTarget("https://lepetitcafe.example/")
+    ).toBeNull();
+  });
+
+  it("does not reuse a completed scan that has no scan_completed_at recorded", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        scanReuseKey: "https://lepetitcafe.example/",
+        requestStatus: "scan_ready_needs_review",
+        scanId: "scan-x"
+        // scanCompletedAt deliberately absent
+      })
+    );
+    expect(
+      store.latestCompletedScanForTarget("https://lepetitcafe.example/")
+    ).toBeNull();
   });
 
   it("returns null for a target that has never completed a scan", () => {
     const store = new InMemoryPublicIntakeStore();
-    expect(store.latestCompletedScanForTarget("never-seen.example")).toBeNull();
+    expect(store.latestCompletedScanForTarget("https://never-seen.example/")).toBeNull();
   });
 
-  it("returns the most recent failed-scan timestamp for a target", () => {
+  it("returns the most recent failed-scan timestamp for a hostname-level target, using scan_failed_at", () => {
     const store = new InMemoryPublicIntakeStore();
     store.insertRequest(
       record({
         scanTargetKey: "lepetitcafe.example",
         requestStatus: "analysis_failed",
-        createdAt: "2026-08-17T10:00:00.000Z"
+        createdAt: "2026-08-17T09:00:00.000Z",
+        scanFailedAt: "2026-08-17T10:00:00.000Z"
       })
     );
     expect(store.latestFailedScanAtForTarget("lepetitcafe.example")).toBe(
@@ -190,40 +227,103 @@ describe("InMemoryPublicIntakeStore — target cooldown/reuse lookups (Task #5A-
     expect(store.latestFailedScanAtForTarget("lepetitcafe.example")).toBeNull();
   });
 
-  it("reports a target as currently scanning only while a fresh scanning row exists", () => {
+  it("reports a target as currently scanning only while a fresh scanning row (matching scanReuseKey) exists", () => {
     const store = new InMemoryPublicIntakeStore();
     store.insertRequest(
       record({
-        scanTargetKey: "lepetitcafe.example",
+        scanReuseKey: "https://lepetitcafe.example/",
         requestStatus: "scanning",
         updatedAt: "2026-08-17T09:59:30.000Z" // 30s old
       })
     );
     expect(
       store.isTargetCurrentlyScanning(
-        "lepetitcafe.example",
+        "https://lepetitcafe.example/",
         "2026-08-17T10:00:00.000Z",
         120_000
       )
     ).toBe(true);
   });
 
+  it("does not treat a scan of a different path as the same target being in flight", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        scanReuseKey: "https://lepetitcafe.example/menu",
+        requestStatus: "scanning",
+        updatedAt: "2026-08-17T09:59:30.000Z"
+      })
+    );
+    expect(
+      store.isTargetCurrentlyScanning(
+        "https://lepetitcafe.example/",
+        "2026-08-17T10:00:00.000Z",
+        120_000
+      )
+    ).toBe(false);
+  });
+
   it("a STALE scanning row does not block a new attempt at the same target", () => {
     const store = new InMemoryPublicIntakeStore();
     store.insertRequest(
       record({
-        scanTargetKey: "lepetitcafe.example",
+        scanReuseKey: "https://lepetitcafe.example/",
         requestStatus: "scanning",
         updatedAt: "2026-08-17T09:00:00.000Z" // 1h old — well past a 2-minute max age
       })
     );
     expect(
       store.isTargetCurrentlyScanning(
-        "lepetitcafe.example",
+        "https://lepetitcafe.example/",
         "2026-08-17T10:00:00.000Z",
         120_000
       )
     ).toBe(false);
+  });
+});
+
+describe("InMemoryPublicIntakeStore — recoverStaleScanningRows (Task #5A-fix round 3 §2)", () => {
+  it("leaves a fresh scanning row untouched", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        id: "fresh",
+        requestStatus: "scanning",
+        updatedAt: "2026-08-17T09:59:30.000Z" // 30s old
+      })
+    );
+    store.recoverStaleScanningRows("2026-08-17T10:00:00.000Z", 120_000);
+    expect(store.getRequest("fresh")!.requestStatus).toBe("scanning");
+  });
+
+  it("re-queues a stale scanning row, clearing transient scan fields", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        id: "stuck",
+        requestStatus: "scanning",
+        scanId: "half-baked",
+        updatedAt: "2026-08-17T09:00:00.000Z" // 1h old
+      })
+    );
+    store.recoverStaleScanningRows("2026-08-17T10:00:00.000Z", 120_000);
+    const recovered = store.getRequest("stuck")!;
+    expect(recovered.requestStatus).toBe("queued_for_scan");
+    expect(recovered.scanId).toBeUndefined();
+  });
+
+  it("running recovery twice is safe/idempotent", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({
+        id: "stuck",
+        requestStatus: "scanning",
+        updatedAt: "2026-08-17T09:00:00.000Z"
+      })
+    );
+    store.recoverStaleScanningRows("2026-08-17T10:00:00.000Z", 120_000);
+    store.recoverStaleScanningRows("2026-08-17T10:00:05.000Z", 120_000);
+    expect(store.getRequest("stuck")!.requestStatus).toBe("queued_for_scan");
   });
 });
 

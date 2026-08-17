@@ -32,8 +32,26 @@ export interface InboundRequestRecord {
   whatsapp?: string;
   submittedLink?: string;
   linkKind: SubmittedLinkKind;
-  /** Hostname-level normalization of submittedLink, only set for linkKind "website" — see normalizeScanTargetKey(). */
+  /**
+   * Hostname-level normalization of submittedLink, only set for linkKind
+   * "website" — see normalizeScanTargetKey(). This is the ABUSE/COST
+   * cooldown identity (coarse on purpose: example.com/menu and
+   * example.com/contact share it), used for the failed-scan retry
+   * backoff. It is deliberately too coarse to reuse an actual scan
+   * result across different pages of the same host — see scanReuseKey.
+   */
   scanTargetKey?: string;
+  /**
+   * Exact normalized target URL (fragment stripped only — path/query are
+   * never rewritten), only set for linkKind "website" — see
+   * normalizeScanReuseKey(). This is the SCAN-RESULT identity: a
+   * completed scan is only reused for a new request when both share this
+   * exact key, and a duplicate concurrent scan is only skipped when both
+   * share this exact key. ReelScan v1 scans one specific submitted page,
+   * so reuse coarser than this would silently hand back the wrong page's
+   * result.
+   */
+  scanReuseKey?: string;
   issue?: string;
   language: IntakeLanguage;
 
@@ -41,6 +59,10 @@ export interface InboundRequestRecord {
   scanId?: string;
   scanStatus?: "completed" | "failed";
   analysisErrorCode?: string;
+  /** When a scan for THIS row actually completed — the basis for the 24h reuse freshness window, never createdAt. */
+  scanCompletedAt?: string;
+  /** When a scan for THIS row actually failed — the basis for the short retry backoff, never createdAt. */
+  scanFailedAt?: string;
 
   sourceOrigin?: string;
   /** When the customer accepted the privacy notice — request context, not a raw consent log. */
@@ -61,7 +83,12 @@ export interface PublicIntakeStore {
     patch: Partial<
       Pick<
         InboundRequestRecord,
-        "requestStatus" | "scanId" | "scanStatus" | "analysisErrorCode"
+        | "requestStatus"
+        | "scanId"
+        | "scanStatus"
+        | "analysisErrorCode"
+        | "scanCompletedAt"
+        | "scanFailedAt"
       >
     > & { updatedAt: string }
   ): void;
@@ -78,20 +105,39 @@ export interface PublicIntakeStore {
     maxAgeMs: number
   ): boolean;
 
+  /**
+   * Recovers "scanning" rows whose updated_at is older than maxAgeMs back
+   * to "queued_for_scan" (a Worker interruption between reserving a slot
+   * and reaching a terminal status must not leave a row permanently
+   * displayed as "Scanning"). Must be atomic/idempotent: re-running it
+   * against already-recovered or genuinely-active rows is a no-op — see
+   * public-intake-store.test.ts.
+   */
+  recoverStaleScanningRows(nowIso: string, maxAgeMs: number): void;
+
   /** Oldest-first, bounded — the intake queue's work list for one pass. */
   listQueuedForScan(limit: number): InboundRequestRecord[];
 
-  /** The most recent SUCCESSFULLY completed scan for a target, if any — used to reuse a fresh result instead of re-scanning. */
+  /**
+   * The most recent SUCCESSFULLY completed scan for an exact scanReuseKey,
+   * if any — used to reuse a fresh result instead of re-scanning the
+   * identical page. completedAt reflects scan_completed_at (when the scan
+   * itself finished), never createdAt (when the request arrived).
+   */
   latestCompletedScanForTarget(
-    scanTargetKey: string
-  ): { scanId: string; createdAt: string } | null;
+    scanReuseKey: string
+  ): { scanId: string; completedAt: string } | null;
 
-  /** When the most recent FAILED scan for a target happened, if any — a much shorter backoff than the success cooldown. */
+  /**
+   * When the most recent FAILED scan for a (hostname-level) cooldown
+   * target happened, if any — a much shorter backoff than the success
+   * cooldown. Reflects scan_failed_at, never createdAt.
+   */
   latestFailedScanAtForTarget(scanTargetKey: string): string | null;
 
-  /** Whether a (non-stale) scan is currently in flight for this target — used to avoid launching a duplicate concurrent scan of the same URL. */
+  /** Whether a (non-stale) scan is currently in flight for this exact scanReuseKey — used to avoid launching a duplicate concurrent scan of the same URL. */
   isTargetCurrentlyScanning(
-    scanTargetKey: string,
+    scanReuseKey: string,
     nowIso: string,
     maxAgeMs: number
   ): boolean;
@@ -129,7 +175,12 @@ export class InMemoryPublicIntakeStore implements PublicIntakeStore {
     patch: Partial<
       Pick<
         InboundRequestRecord,
-        "requestStatus" | "scanId" | "scanStatus" | "analysisErrorCode"
+        | "requestStatus"
+        | "scanId"
+        | "scanStatus"
+        | "analysisErrorCode"
+        | "scanCompletedAt"
+        | "scanFailedAt"
       >
     > & { updatedAt: string }
   ): void {
@@ -155,6 +206,25 @@ export class InMemoryPublicIntakeStore implements PublicIntakeStore {
     return true;
   }
 
+  recoverStaleScanningRows(nowIso: string, maxAgeMs: number): void {
+    const nowMs = Date.parse(nowIso);
+    for (const record of this.requests.values()) {
+      if (
+        record.requestStatus === "scanning" &&
+        nowMs - Date.parse(record.updatedAt) > maxAgeMs
+      ) {
+        this.requests.set(record.id, {
+          ...record,
+          requestStatus: "queued_for_scan",
+          scanId: undefined,
+          scanStatus: undefined,
+          analysisErrorCode: undefined,
+          updatedAt: nowIso
+        });
+      }
+    }
+  }
+
   listQueuedForScan(limit: number): InboundRequestRecord[] {
     return [...this.requests.values()]
       .filter((record) => record.requestStatus === "queued_for_scan")
@@ -163,18 +233,21 @@ export class InMemoryPublicIntakeStore implements PublicIntakeStore {
   }
 
   latestCompletedScanForTarget(
-    scanTargetKey: string
-  ): { scanId: string; createdAt: string } | null {
+    scanReuseKey: string
+  ): { scanId: string; completedAt: string } | null {
     const matches = [...this.requests.values()]
       .filter(
         (record) =>
-          record.scanTargetKey === scanTargetKey &&
+          record.scanReuseKey === scanReuseKey &&
           record.requestStatus === "scan_ready_needs_review" &&
-          record.scanId
+          record.scanId &&
+          record.scanCompletedAt
       )
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      .sort((a, b) => b.scanCompletedAt!.localeCompare(a.scanCompletedAt!));
     const match = matches[0];
-    return match ? { scanId: match.scanId!, createdAt: match.createdAt } : null;
+    return match
+      ? { scanId: match.scanId!, completedAt: match.scanCompletedAt! }
+      : null;
   }
 
   latestFailedScanAtForTarget(scanTargetKey: string): string | null {
@@ -182,21 +255,22 @@ export class InMemoryPublicIntakeStore implements PublicIntakeStore {
       .filter(
         (record) =>
           record.scanTargetKey === scanTargetKey &&
-          record.requestStatus === "analysis_failed"
+          record.requestStatus === "analysis_failed" &&
+          record.scanFailedAt
       )
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    return matches[0]?.createdAt || null;
+      .sort((a, b) => b.scanFailedAt!.localeCompare(a.scanFailedAt!));
+    return matches[0]?.scanFailedAt || null;
   }
 
   isTargetCurrentlyScanning(
-    scanTargetKey: string,
+    scanReuseKey: string,
     nowIso: string,
     maxAgeMs: number
   ): boolean {
     const nowMs = Date.parse(nowIso);
     return [...this.requests.values()].some(
       (record) =>
-        record.scanTargetKey === scanTargetKey &&
+        record.scanReuseKey === scanReuseKey &&
         record.requestStatus === "scanning" &&
         nowMs - Date.parse(record.updatedAt) <= maxAgeMs
     );
@@ -257,6 +331,7 @@ function mapRequestRow(row: SqlRow): InboundRequestRecord {
     submittedLink: row.submitted_link ? String(row.submitted_link) : undefined,
     linkKind: String(row.link_kind) as SubmittedLinkKind,
     scanTargetKey: row.scan_target_key ? String(row.scan_target_key) : undefined,
+    scanReuseKey: row.scan_reuse_key ? String(row.scan_reuse_key) : undefined,
     issue: row.issue ? String(row.issue) : undefined,
     language: String(row.language) as IntakeLanguage,
     requestStatus: String(row.request_status) as RequestStatus,
@@ -267,6 +342,8 @@ function mapRequestRow(row: SqlRow): InboundRequestRecord {
     analysisErrorCode: row.analysis_error_code
       ? String(row.analysis_error_code)
       : undefined,
+    scanCompletedAt: row.scan_completed_at ? String(row.scan_completed_at) : undefined,
+    scanFailedAt: row.scan_failed_at ? String(row.scan_failed_at) : undefined,
     sourceOrigin: row.source_origin ? String(row.source_origin) : undefined,
     privacyAcceptedAt: String(row.privacy_accepted_at)
   };
@@ -300,16 +377,41 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
       CREATE INDEX IF NOT EXISTS inbound_requests_target
         ON inbound_requests(scan_target_key, created_at DESC);
     `);
+    // Additive/idempotent migration for an already-deployed table — see
+    // sales-agent.ts's ensureDiscoveryColumn() for the same pattern.
+    // scan_reuse_key: the exact-URL scan-result identity (Task #5A-fix
+    // round 3 §3), separate from the coarser hostname-level
+    // scan_target_key abuse/cost cooldown. scan_completed_at/
+    // scan_failed_at: when THIS row's own scan actually finished/failed,
+    // never createdAt (§4).
+    this.ensureColumn("scan_reuse_key", "TEXT");
+    this.ensureColumn("scan_completed_at", "TEXT");
+    this.ensureColumn("scan_failed_at", "TEXT");
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS inbound_requests_reuse
+        ON inbound_requests(scan_reuse_key, scan_completed_at DESC);
+    `);
+  }
+
+  private ensureColumn(column: string, definition: string): void {
+    const exists = this.sql
+      .exec<{ name: string }>("PRAGMA table_info(inbound_requests)")
+      .toArray()
+      .some((item) => item.name === column);
+    if (!exists)
+      this.sql.exec(`ALTER TABLE inbound_requests ADD COLUMN ${column} ${definition}`);
   }
 
   insertRequest(record: InboundRequestRecord): void {
     this.sql.exec(
       `INSERT INTO inbound_requests (
         id, created_at, updated_at, name, business_name, city, support_need,
-        email, whatsapp, submitted_link, link_kind, scan_target_key, issue,
+        email, whatsapp, submitted_link, link_kind, scan_target_key,
+        scan_reuse_key, issue,
         language, request_status, scan_id, scan_status, analysis_error_code,
+        scan_completed_at, scan_failed_at,
         source_origin, privacy_accepted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       record.id,
       record.createdAt,
       record.updatedAt,
@@ -322,12 +424,15 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
       record.submittedLink ?? null,
       record.linkKind,
       record.scanTargetKey ?? null,
+      record.scanReuseKey ?? null,
       record.issue ?? null,
       record.language,
       record.requestStatus,
       record.scanId ?? null,
       record.scanStatus ?? null,
       record.analysisErrorCode ?? null,
+      record.scanCompletedAt ?? null,
+      record.scanFailedAt ?? null,
       record.sourceOrigin ?? null,
       record.privacyAcceptedAt
     );
@@ -355,7 +460,12 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
     patch: Partial<
       Pick<
         InboundRequestRecord,
-        "requestStatus" | "scanId" | "scanStatus" | "analysisErrorCode"
+        | "requestStatus"
+        | "scanId"
+        | "scanStatus"
+        | "analysisErrorCode"
+        | "scanCompletedAt"
+        | "scanFailedAt"
       >
     > & { updatedAt: string }
   ): void {
@@ -365,12 +475,15 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
     this.sql.exec(
       `UPDATE inbound_requests SET
         request_status = ?, scan_id = ?, scan_status = ?,
-        analysis_error_code = ?, updated_at = ?
+        analysis_error_code = ?, scan_completed_at = ?, scan_failed_at = ?,
+        updated_at = ?
       WHERE id = ?`,
       next.requestStatus,
       next.scanId ?? null,
       next.scanStatus ?? null,
       next.analysisErrorCode ?? null,
+      next.scanCompletedAt ?? null,
+      next.scanFailedAt ?? null,
       next.updatedAt,
       id
     );
@@ -398,6 +511,23 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
     return true;
   }
 
+  recoverStaleScanningRows(nowIso: string, maxAgeMs: number): void {
+    // A single bulk UPDATE — atomic, and idempotent by construction: once
+    // a row's status is no longer 'scanning' it can never match this
+    // WHERE clause again, so re-running this against the same rows (an
+    // at-least-once scheduled callback re-delivery) is a safe no-op.
+    // Never touches a fresh (non-stale) "scanning" row.
+    const cutoffIso = new Date(Date.parse(nowIso) - maxAgeMs).toISOString();
+    this.sql.exec(
+      `UPDATE inbound_requests SET
+        request_status = 'queued_for_scan', scan_id = NULL, scan_status = NULL,
+        analysis_error_code = NULL, updated_at = ?
+      WHERE request_status = 'scanning' AND updated_at <= ?`,
+      nowIso,
+      cutoffIso
+    );
+  }
+
   listQueuedForScan(limit: number): InboundRequestRecord[] {
     return this.sql
       .exec<SqlRow>(
@@ -410,34 +540,35 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
   }
 
   latestCompletedScanForTarget(
-    scanTargetKey: string
-  ): { scanId: string; createdAt: string } | null {
+    scanReuseKey: string
+  ): { scanId: string; completedAt: string } | null {
     const row = this.sql
-      .exec<{ scan_id: string; created_at: string }>(
-        `SELECT scan_id, created_at FROM inbound_requests
-         WHERE scan_target_key = ? AND request_status = 'scan_ready_needs_review'
-           AND scan_id IS NOT NULL
-         ORDER BY created_at DESC LIMIT 1`,
-        scanTargetKey
+      .exec<{ scan_id: string; scan_completed_at: string }>(
+        `SELECT scan_id, scan_completed_at FROM inbound_requests
+         WHERE scan_reuse_key = ? AND request_status = 'scan_ready_needs_review'
+           AND scan_id IS NOT NULL AND scan_completed_at IS NOT NULL
+         ORDER BY scan_completed_at DESC LIMIT 1`,
+        scanReuseKey
       )
       .toArray()[0];
-    return row ? { scanId: row.scan_id, createdAt: row.created_at } : null;
+    return row ? { scanId: row.scan_id, completedAt: row.scan_completed_at } : null;
   }
 
   latestFailedScanAtForTarget(scanTargetKey: string): string | null {
     const row = this.sql
-      .exec<{ created_at: string }>(
-        `SELECT created_at FROM inbound_requests
+      .exec<{ scan_failed_at: string }>(
+        `SELECT scan_failed_at FROM inbound_requests
          WHERE scan_target_key = ? AND request_status = 'analysis_failed'
-         ORDER BY created_at DESC LIMIT 1`,
+           AND scan_failed_at IS NOT NULL
+         ORDER BY scan_failed_at DESC LIMIT 1`,
         scanTargetKey
       )
       .toArray()[0];
-    return row ? row.created_at : null;
+    return row ? row.scan_failed_at : null;
   }
 
   isTargetCurrentlyScanning(
-    scanTargetKey: string,
+    scanReuseKey: string,
     nowIso: string,
     maxAgeMs: number
   ): boolean {
@@ -445,9 +576,9 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
     const row = this.sql
       .exec<{ found: number }>(
         `SELECT 1 AS found FROM inbound_requests
-         WHERE scan_target_key = ? AND request_status = 'scanning' AND updated_at > ?
+         WHERE scan_reuse_key = ? AND request_status = 'scanning' AND updated_at > ?
          LIMIT 1`,
-        scanTargetKey,
+        scanReuseKey,
         cutoffIso
       )
       .toArray()[0];

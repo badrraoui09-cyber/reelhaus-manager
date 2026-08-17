@@ -57,6 +57,30 @@ export function normalizeScanTargetKey(url: string): string {
   }
 }
 
+/**
+ * Exact-target scan-RESULT identity (Task #5A-fix round 3 §3) — distinct
+ * from normalizeScanTargetKey()'s hostname-level abuse/cost cooldown key.
+ * ReelScan v1 scans one specific submitted page, so reusing a completed
+ * scan (or detecting an in-flight duplicate) must match the exact target,
+ * not just the host: https://example.com/menu must never be served the
+ * result of a scan of https://example.com/. Only the URL fragment is
+ * stripped — it is never sent to the server, so two URLs differing only
+ * by fragment are the same fetch target by construction. Path, query,
+ * and trailing-slash presence are preserved exactly as validated; this
+ * deliberately does NOT canonicalize further (e.g. to the site's
+ * homepage) — that would silently rewrite an intentional customer-
+ * submitted path without a product reason.
+ */
+export function normalizeScanReuseKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return url.trim();
+  }
+}
+
 export type PublicIntakeOutcome =
   | { accepted: true; id: string }
   | { accepted: false; reason: "rate_limited" | "invalid_request" };
@@ -117,6 +141,10 @@ export class PublicIntakeService {
       link.kind === "website" && link.normalizedUrl
         ? normalizeScanTargetKey(link.normalizedUrl)
         : undefined;
+    const scanReuseKey =
+      link.kind === "website" && link.normalizedUrl
+        ? normalizeScanReuseKey(link.normalizedUrl)
+        : undefined;
     const isWebsite = link.kind === "website" && Boolean(link.normalizedUrl);
 
     const id = crypto.randomUUID();
@@ -133,6 +161,7 @@ export class PublicIntakeService {
       submittedLink: link.raw,
       linkKind: link.kind,
       scanTargetKey,
+      scanReuseKey,
       issue: input.issue,
       language: input.language,
       // No scannable website — a legitimate business without a site is
@@ -149,8 +178,20 @@ export class PublicIntakeService {
     if (isWebsite) {
       try {
         await this.deps.scheduleQueueProcessing();
-      } catch {
-        // Best-effort — see the scheduleQueueProcessing doc comment above.
+      } catch (error) {
+        // Task #5A-fix round 3 §1: a failure to durably establish queue
+        // processing must NOT produce a normal accepted-success outcome —
+        // "the next customer's request may incidentally wake it up" is
+        // not a guarantee. Move the row to a terminal state so it is
+        // never displayed as permanently "Queued", and propagate so the
+        // public route's existing boundary (public-intake-route.ts) maps
+        // this to the generic try_again_later — never exposing why.
+        store.updateRequestStatus(id, {
+          requestStatus: "analysis_failed",
+          analysisErrorCode: "queue_schedule_failed",
+          updatedAt: new Date().toISOString()
+        });
+        throw error;
       }
     }
 
@@ -167,14 +208,21 @@ export class PublicIntakeService {
    * this against the same rows is a no-op past the point they've already
    * moved out of "queued_for_scan" — at-least-once execution is safe.
    *
+   * Also recovers any stale "scanning" rows back to queued_for_scan first
+   * (see recoverStaleScanningRows) so an interrupted scan is retried, not
+   * stuck forever.
+   *
    * For each queued row with a website target:
    *  - a recent (within TARGET_SCAN_COOLDOWN_MS) COMPLETED scan for the
-   *    same target is reused (linked by scanId) instead of re-scanning;
+   *    exact same target URL (scanReuseKey) is reused (linked by scanId)
+   *    instead of re-scanning — never merely the same hostname;
+   *  - a currently in-flight scan of the exact same target URL defers
+   *    this row to a later pass rather than launching a duplicate
+   *    concurrent scan;
    *  - a recent (within FAILED_SCAN_RETRY_BACKOFF_MS) FAILED scan for the
-   *    same target defers this row to a later pass — a transient
-   *    technical failure must not poison the target for a full day;
-   *  - a currently in-flight scan of the same target defers this row to
-   *    a later pass rather than launching a duplicate concurrent scan;
+   *    same HOSTNAME (scanTargetKey — coarser, an abuse/cost control)
+   *    defers this row to a later pass — a transient technical failure
+   *    must not poison the target for a full day;
    *  - otherwise it competes for a global concurrency slot exactly as
    *    before, and is skipped (left queued) if capacity is full.
    *
@@ -187,25 +235,47 @@ export class PublicIntakeService {
   ): Promise<{ remainingQueued: boolean }> {
     const { store } = this.deps;
     const nowIso = new Date(nowMs).toISOString();
+
+    // Task #5A-fix round 3 §2: a Worker interrupted between reserving a
+    // scanning slot and reaching a terminal status must not leave that
+    // row permanently displayed as "Scanning" — recover it back to
+    // queued_for_scan BEFORE this pass's normal work, so it's eligible
+    // to be picked up in the same pass. Atomic bulk UPDATE; never touches
+    // a fresh (non-stale) scan.
+    store.recoverStaleScanningRows(nowIso, SCAN_RESERVATION_MAX_AGE_MS);
+
     const queued = store.listQueuedForScan(batchLimit);
 
     for (const row of queued) {
-      if (row.scanTargetKey) {
-        const completed = store.latestCompletedScanForTarget(row.scanTargetKey);
+      // scanReuseKey (exact normalized target URL) gates completed-scan
+      // reuse and in-flight-duplicate detection — ReelScan v1 scans one
+      // specific page, so a hostname match alone is not enough (§3).
+      // scanTargetKey (hostname-level) still gates the failed-scan
+      // backoff — an abuse/cost control, coarse-by-design.
+      if (row.scanReuseKey) {
+        const completed = store.latestCompletedScanForTarget(row.scanReuseKey);
         if (
           completed &&
-          evaluateTargetCooldown(completed.createdAt, nowMs, TARGET_SCAN_COOLDOWN_MS)
+          evaluateTargetCooldown(completed.completedAt, nowMs, TARGET_SCAN_COOLDOWN_MS)
             .allowed === false
         ) {
           store.updateRequestStatus(row.id, {
             requestStatus: "scan_ready_needs_review",
             scanId: completed.scanId,
             scanStatus: "completed",
+            scanCompletedAt: completed.completedAt,
             updatedAt: nowIso
           });
           continue;
         }
 
+        if (
+          store.isTargetCurrentlyScanning(row.scanReuseKey, nowIso, SCAN_RESERVATION_MAX_AGE_MS)
+        )
+          continue; // another in-flight scan of the exact same URL; wait, don't duplicate
+      }
+
+      if (row.scanTargetKey) {
         const failedAt = store.latestFailedScanAtForTarget(row.scanTargetKey);
         if (
           failedAt &&
@@ -214,9 +284,6 @@ export class PublicIntakeService {
         ) {
           continue; // too soon to retry after a technical failure; try again next pass
         }
-
-        if (store.isTargetCurrentlyScanning(row.scanTargetKey, nowIso, SCAN_RESERVATION_MAX_AGE_MS))
-          continue; // another in-flight scan for the same target; wait, don't duplicate
       }
 
       if (!row.submittedLink) {
@@ -225,6 +292,7 @@ export class PublicIntakeService {
         store.updateRequestStatus(row.id, {
           requestStatus: "analysis_failed",
           analysisErrorCode: "missing_target_url",
+          scanFailedAt: nowIso,
           updatedAt: nowIso
         });
         continue;
@@ -246,6 +314,7 @@ export class PublicIntakeService {
           auditLedger: this.deps.auditLedger,
           fetcher: this.deps.fetcher
         });
+        const finishedAt = new Date().toISOString();
         const finalStatus: RequestStatus =
           result.reviewStatus === "needs_review"
             ? "scan_ready_needs_review"
@@ -258,7 +327,12 @@ export class PublicIntakeService {
             result.analysisRun.status === "failed"
               ? result.analysisRun.error || "analysis_failed"
               : undefined,
-          updatedAt: new Date().toISOString()
+          // Task #5A-fix round 3 §4: the freshness/backoff clock starts
+          // at scan OUTCOME time, never createdAt (the request may have
+          // sat queued for a while first).
+          scanCompletedAt: finalStatus === "scan_ready_needs_review" ? finishedAt : undefined,
+          scanFailedAt: finalStatus === "analysis_failed" ? finishedAt : undefined,
+          updatedAt: finishedAt
         });
       } catch (error) {
         // Always resolves the reservation — success and failure paths both
@@ -268,6 +342,7 @@ export class PublicIntakeService {
           requestStatus: "analysis_failed",
           analysisErrorCode:
             error instanceof ReelScanTargetError ? error.reason : "unknown_error",
+          scanFailedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         });
       }

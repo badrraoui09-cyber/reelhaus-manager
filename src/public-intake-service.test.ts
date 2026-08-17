@@ -158,20 +158,61 @@ describe("PublicIntakeService.submit — link handling", () => {
     expect(scheduleCalls).toBe(1); // unchanged — no website target to queue
   });
 
-  it("a failing scheduleQueueProcessing does not fail the request — the row is still durably queued", async () => {
-    const { service, store } = buildService({
+  // Task #5A-fix round 3 §1: a failure to durably establish queue
+  // processing must NOT produce a normal accepted-success outcome — the
+  // previous "swallow it, the next request may wake it up" behavior
+  // could strand a request with no guaranteed future wake-up.
+  it("a failing scheduleQueueProcessing does not return an accepted-success outcome, and does not leave the row queued forever", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    const service = new PublicIntakeService({
+      store,
+      auditLedger: new AuditLedgerService(new InMemoryAuditLedgerStore()),
+      ai: successfulAi(),
+      fetcher: (async () => new Response("", { status: 200 })) as unknown as typeof fetch,
       scheduleQueueProcessing: async () => {
-        throw new Error("internal scheduling detail");
+        throw new Error("internal scheduling detail — must never reach the caller");
       }
     });
-    const outcome = await service.submit(
-      baseRequest({ link: "https://lepetitcafe.example/" }),
-      "caller-1",
-      null
-    );
-    expect(outcome.accepted).toBe(true);
-    const stored = store.getRequest((outcome as { id: string }).id)!;
-    expect(stored.requestStatus).toBe("queued_for_scan");
+
+    await expect(
+      service.submit(baseRequest({ link: "https://lepetitcafe.example/" }), "caller-1", null)
+    ).rejects.toThrow();
+
+    // Exactly one row was inserted (submit() got as far as insertRequest
+    // before scheduling failed) and it must NOT be left in queued_for_scan.
+    const rows = store.listRequests(10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].requestStatus).toBe("analysis_failed");
+    expect(rows[0].analysisErrorCode).toBe("queue_schedule_failed");
+    expect(store.listQueuedForScan(10)).toHaveLength(0);
+  });
+
+  it("public-intake-route.ts's boundary turns a schedule failure into a generic try_again_later, never the internal reason", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    const service = new PublicIntakeService({
+      store,
+      auditLedger: new AuditLedgerService(new InMemoryAuditLedgerStore()),
+      ai: successfulAi(),
+      fetcher: (async () => new Response("", { status: 200 })) as unknown as typeof fetch,
+      scheduleQueueProcessing: async () => {
+        throw new Error("internal scheduling detail — must never reach the caller");
+      }
+    });
+    // Mirrors exactly what public-intake-route.ts's try/catch does with
+    // whatever submit() throws — see public-intake-route.test.ts for the
+    // full HTTP-level regression of this same guarantee.
+    try {
+      await service.submit(
+        baseRequest({ link: "https://lepetitcafe.example/" }),
+        "caller-1",
+        null
+      );
+      expect.unreachable();
+    } catch (error) {
+      const publicPayload = { ok: false, error: "try_again_later" };
+      expect(JSON.stringify(publicPayload)).not.toContain("internal scheduling detail");
+      expect(error).toBeInstanceOf(Error);
+    }
   });
 
   it("rejects an unsupported-protocol target as a harmless other_reference — request still accepted, no scan run", async () => {
@@ -416,8 +457,8 @@ describe("PublicIntakeService.processQueue — draining the queue", () => {
   });
 });
 
-describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-fix §6)", () => {
-  it("reuses a recent completed scan for the same target instead of re-scanning", async () => {
+describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-fix round 3 §3)", () => {
+  it("reuses a recent completed scan for the exact SAME normalized target instead of re-scanning", async () => {
     let scanAttempts = 0;
     const store = new InMemoryPublicIntakeStore();
     const { service } = buildService({
@@ -442,7 +483,7 @@ describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-f
     expect(firstRecord.requestStatus).toBe("scan_ready_needs_review");
 
     const second = await service.submit(
-      baseRequest({ link: "https://lepetitcafe.example/menu" }), // different path, same host
+      baseRequest({ link: "https://lepetitcafe.example/" }), // exact same URL
       "caller-2",
       null
     );
@@ -452,6 +493,51 @@ describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-f
     const secondRecord = store.getRequest((second as { id: string }).id)!;
     expect(secondRecord.requestStatus).toBe("scan_ready_needs_review");
     expect(secondRecord.scanId).toBe(firstRecord.scanId); // linked, not duplicated
+  });
+
+  it("does NOT reuse a completed scan for a DIFFERENT path on the same hostname — ReelScan v1 scans one specific page", async () => {
+    let scanAttempts = 0;
+    const store = new InMemoryPublicIntakeStore();
+    const { service } = buildService({
+      store,
+      fetcher: (async () => {
+        scanAttempts++;
+        return new Response(SAFE_HTML, {
+          status: 200,
+          headers: { "content-type": "text/html" }
+        });
+      }) as unknown as typeof fetch
+    });
+
+    const first = await service.submit(
+      baseRequest({ link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const firstRecord = store.getRequest((first as { id: string }).id)!;
+    expect(firstRecord.requestStatus).toBe("scan_ready_needs_review");
+
+    const second = await service.submit(
+      baseRequest({ link: "https://lepetitcafe.example/menu" }), // different path, same host
+      "caller-2",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+
+    expect(scanAttempts).toBe(2); // a genuinely separate scan ran
+    const secondRecord = store.getRequest((second as { id: string }).id)!;
+    expect(secondRecord.requestStatus).toBe("scan_ready_needs_review");
+    expect(secondRecord.scanId).not.toBe(firstRecord.scanId); // NOT linked — different page
+  });
+
+  it("hostname-level abuse cooldown (scanTargetKey) is unaffected by the exact-URL reuse key change", () => {
+    // Both distinct paths still normalize to the same COOLDOWN identity —
+    // only scan-result REUSE requires an exact match, not the abuse
+    // cooldown itself.
+    expect(normalizeScanTargetKey("https://lepetitcafe.example/")).toBe(
+      normalizeScanTargetKey("https://lepetitcafe.example/menu")
+    );
   });
 
   it("does NOT apply the full successful-scan cooldown after a transient technical failure", async () => {
@@ -548,6 +634,7 @@ describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-f
       email: "x@example.com",
       linkKind: "website",
       scanTargetKey: "lepetitcafe.example",
+      scanReuseKey: "https://lepetitcafe.example/",
       language: "fr",
       requestStatus: "scanning",
       privacyAcceptedAt: now
@@ -591,7 +678,9 @@ describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-f
       supportNeed: "unknown",
       email: "x@example.com",
       linkKind: "website",
+      submittedLink: "https://lepetitcafe.example/other-page",
       scanTargetKey: "lepetitcafe.example",
+      scanReuseKey: "https://lepetitcafe.example/other-page",
       language: "fr",
       requestStatus: "scanning",
       privacyAcceptedAt: staleTime
@@ -608,6 +697,39 @@ describe("PublicIntakeService.processQueue — target cooldown/reuse (Task #5A-f
     );
     await service.processQueue(Date.now(), 20);
     expect(usedStore.getRequest((outcome as { id: string }).id)!.requestStatus).toBe(
+      "scan_ready_needs_review"
+    );
+  });
+
+  it("the stale row itself is recovered and re-processed (round 3 §2), not merely unblocked", async () => {
+    const store = new InMemoryPublicIntakeStore();
+    const staleTime = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    store.insertRequest({
+      id: "stuck",
+      createdAt: staleTime,
+      updatedAt: staleTime,
+      name: "x",
+      businessName: "x",
+      city: "x",
+      supportNeed: "unknown",
+      email: "x@example.com",
+      linkKind: "website",
+      submittedLink: "https://lepetitcafe.example/",
+      scanTargetKey: "lepetitcafe.example",
+      scanReuseKey: "https://lepetitcafe.example/",
+      language: "fr",
+      requestStatus: "scanning",
+      privacyAcceptedAt: staleTime
+    });
+
+    const { service, store: usedStore } = buildService({
+      store,
+      fetcher: websiteFetcher(SAFE_HTML)
+    });
+    await service.processQueue(Date.now(), 20);
+    // The originally-stuck row itself reached a terminal state — it was
+    // not just "unblocked" for some OTHER new request to take its place.
+    expect(usedStore.getRequest("stuck")!.requestStatus).toBe(
       "scan_ready_needs_review"
     );
   });
