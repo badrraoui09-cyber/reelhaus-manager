@@ -4,10 +4,18 @@ import { AuditLedgerService, SqlAuditLedgerStore } from "./audit-ledger";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
 import {
   AGENT_HUNG_SCHEDULE_TIMEOUT_SECONDS,
+  PUBLIC_INTAKE_RETENTION_DAYS,
   QUEUE_BATCH_LIMIT,
-  QUEUE_RETRY_DELAY_SECONDS
+  QUEUE_RETRY_DELAY_SECONDS,
+  RETENTION_CLEANUP_BATCH_LIMIT,
+  RETENTION_CLEANUP_CONTINUATION_DELAY_SECONDS
 } from "./public-intake-config";
 import { handlePublicReelScanRequest } from "./public-intake-route";
+import {
+  PublicIntakeRetentionService,
+  SqlRetentionStatusStore,
+  ensureRetentionCleanupSchedule
+} from "./public-intake-retention";
 import { PublicIntakeService, listInboundRequestsForManager } from "./public-intake-service";
 import { SqlPublicIntakeStore } from "./public-intake-store";
 import { runReelScanV1ClientZero } from "./reelscan";
@@ -165,6 +173,7 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
 
   private readonly auditLedger: AuditLedgerService;
   private readonly publicIntakeStore: SqlPublicIntakeStore;
+  private readonly retentionStatusStore: SqlRetentionStatusStore;
 
   constructor(ctx: DurableObjectState, env: SalesEnv) {
     super(ctx, env);
@@ -172,6 +181,7 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       new SqlAuditLedgerStore(this.ctx.storage.sql)
     );
     this.publicIntakeStore = new SqlPublicIntakeStore(this.ctx.storage.sql);
+    this.retentionStatusStore = new SqlRetentionStatusStore(this.ctx.storage.sql);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS reports (
         id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
@@ -399,6 +409,8 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
         return json(
           listInboundRequestsForManager(this.publicIntakeStore, this.auditLedger)
         );
+      if (request.method === "GET" && url.pathname === "/inbound-retention/status")
+        return await this.inboundRetentionStatus();
       if (
         request.method === "GET" &&
         /^\/audit\/scans\/[^/]+$/.test(url.pathname)
@@ -592,6 +604,71 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       await this.schedule(QUEUE_RETRY_DELAY_SECONDS, "processInboundScanQueue", undefined, {
         idempotent: true
       });
+  }
+
+  // Owner retention decision (between Task #5B.2 and #5B.3): public
+  // ReelScan inquiry records must be deleted no later than
+  // PUBLIC_INTAKE_RETENTION_DAYS after created_at. Runs on the agents SDK's
+  // own cron scheduling (SQLite-backed, idempotent by callback+cron+
+  // payload) rather than a hand-rolled Durable Object alarm() — the same
+  // reasoning as scheduleInboundScanQueue() above, and explicitly required:
+  // the Agent base class already owns alarm/scheduling behavior. onStart()
+  // runs on every Durable Object wake, so ensureRetentionCleanupSchedule()
+  // must itself be idempotent — it is, by construction (see
+  // public-intake-retention.ts's doc comment on ScheduleRetentionCleanupFn).
+  async onStart(): Promise<void> {
+    await ensureRetentionCleanupSchedule((when, callback, payload, options) =>
+      this.schedule(when, callback, payload, options)
+    );
+  }
+
+  /**
+   * The retention cleanup's scheduled callback (named exactly as passed to
+   * schedule() in onStart() above). All the actual deletion/reference-
+   * safety logic lives in PublicIntakeRetentionService.cleanup(), fully
+   * unit tested without a Durable Object; this method is deliberately a
+   * thin wrapper that also decides whether to re-arm a follow-up pass for
+   * an oversized backlog — mirrors processInboundScanQueue() exactly.
+   */
+  async runInboundRetentionCleanup(): Promise<void> {
+    const service = new PublicIntakeRetentionService({
+      store: this.publicIntakeStore,
+      auditLedger: this.auditLedger,
+      statusStore: this.retentionStatusStore
+    });
+    const nowIso = new Date().toISOString();
+    const { moreRemaining } = service.cleanup(nowIso, RETENTION_CLEANUP_BATCH_LIMIT);
+    if (moreRemaining)
+      await this.schedule(
+        RETENTION_CLEANUP_CONTINUATION_DELAY_SECONDS,
+        "runInboundRetentionCleanup",
+        undefined,
+        { idempotent: true }
+      );
+  }
+
+  // Private, Manager-only observability (§9): aggregate operational
+  // metadata only — retention day count, whether the daily schedule
+  // exists, its next/last run time, and the last pass's deletion counts.
+  // No personal data. Protected by the same Cloudflare Access boundary as
+  // every other /api/* route except the one deliberate public exception —
+  // see server-routing.ts's API_ROUTES/PUBLIC_API_ROUTES split.
+  private async inboundRetentionStatus(): Promise<Response> {
+    const schedules = await this.listSchedules({ type: "cron" });
+    const cleanupSchedule = schedules.find(
+      (schedule) => schedule.callback === "runInboundRetentionCleanup"
+    );
+    const status = this.retentionStatusStore.getStatus();
+    return json({
+      retentionDays: PUBLIC_INTAKE_RETENTION_DAYS,
+      scheduleConfigured: Boolean(cleanupSchedule),
+      nextCleanupAt: cleanupSchedule
+        ? new Date(cleanupSchedule.time * 1000).toISOString()
+        : null,
+      lastCleanupAt: status.lastCleanupAt,
+      lastDeletedRequests: status.lastDeletedRequests,
+      lastDeletedScanTrails: status.lastDeletedScanTrails
+    });
   }
 
   private usage(day = new Date().toISOString().slice(0, 10)) {

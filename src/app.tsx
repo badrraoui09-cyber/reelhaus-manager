@@ -1838,6 +1838,10 @@ export default function App() {
                     abgeschlossene Analyse braucht eine manuelle
                     Freigabeprüfung.
                   </p>
+                  <p className="muted">
+                    Öffentliche ReelScan-Anfragen werden maximal 90 Tage
+                    gespeichert.
+                  </p>
                 </div>
                 <button
                   className="secondary"

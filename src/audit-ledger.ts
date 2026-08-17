@@ -118,6 +118,22 @@ export interface AuditLedgerStore {
 
   insertReviewEvent(event: FindingReviewEvent): void;
   listReviewEventsByScan(scanId: string): FindingReviewEvent[];
+
+  /**
+   * Retention (see public-intake-retention.ts): permanently deletes every
+   * row of this scan's audit trail, in dependency order — review events
+   * first (they reference findings), then findings (they reference
+   * analysis runs), then analysis runs, then evidence last. Callers must
+   * only invoke this once no inbound_requests row still references
+   * scanId — see PublicIntakeStore.countRequestsReferencingScan(). Never
+   * called for a scanId that isn't derived from an expired public-intake
+   * request (e.g. Client #0's scan trail is never eligible, since it has
+   * no corresponding inbound_requests row at all).
+   */
+  deleteReviewEventsByScan(scanId: string): void;
+  deleteFindingsByScan(scanId: string): void;
+  deleteAnalysisRunsByScan(scanId: string): void;
+  deleteEvidenceByScan(scanId: string): void;
 }
 
 export class InMemoryAuditLedgerStore implements AuditLedgerStore {
@@ -188,6 +204,29 @@ export class InMemoryAuditLedgerStore implements AuditLedgerStore {
     return [...this.reviewEvents.values()]
       .filter((event) => scanFindingIds.has(event.findingId))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  deleteReviewEventsByScan(scanId: string): void {
+    const findingIds = new Set(
+      this.listFindingsByScan(scanId).map((finding) => finding.id)
+    );
+    for (const [id, event] of this.reviewEvents.entries())
+      if (findingIds.has(event.findingId)) this.reviewEvents.delete(id);
+  }
+
+  deleteFindingsByScan(scanId: string): void {
+    for (const [id, finding] of this.findings.entries())
+      if (finding.scanId === scanId) this.findings.delete(id);
+  }
+
+  deleteAnalysisRunsByScan(scanId: string): void {
+    for (const [id, run] of this.analysisRuns.entries())
+      if (run.scanId === scanId) this.analysisRuns.delete(id);
+  }
+
+  deleteEvidenceByScan(scanId: string): void {
+    for (const [id, evidence] of this.evidence.entries())
+      if (evidence.scanId === scanId) this.evidence.delete(id);
   }
 }
 
@@ -503,6 +542,29 @@ export class SqlAuditLedgerStore implements AuditLedgerStore {
       .toArray()
       .map(mapReviewEventRow);
   }
+
+  deleteReviewEventsByScan(scanId: string): void {
+    this.sql.exec(
+      `DELETE FROM audit_review_events
+       WHERE finding_id IN (SELECT id FROM audit_findings WHERE scan_id = ?)`,
+      scanId
+    );
+  }
+
+  deleteFindingsByScan(scanId: string): void {
+    this.sql.exec("DELETE FROM audit_findings WHERE scan_id = ?", scanId);
+  }
+
+  deleteAnalysisRunsByScan(scanId: string): void {
+    this.sql.exec(
+      "DELETE FROM audit_analysis_runs WHERE scan_id = ?",
+      scanId
+    );
+  }
+
+  deleteEvidenceByScan(scanId: string): void {
+    this.sql.exec("DELETE FROM audit_evidence WHERE scan_id = ?", scanId);
+  }
 }
 
 export class AuditLedgerService {
@@ -625,6 +687,22 @@ export class AuditLedgerService {
       findings: this.store.listFindingsByScan(scanId),
       reviewEvents: this.store.listReviewEventsByScan(scanId)
     };
+  }
+
+  /**
+   * Retention (see public-intake-retention.ts): permanently deletes a
+   * scan's full audit trail, in the dependency order the underlying
+   * FOREIGN KEY relationships require — review events (reference
+   * findings) before findings (reference analysis runs) before analysis
+   * runs, with evidence last (nothing references it by FK; findings/
+   * analysis runs only cite it by ID inside their own JSON arrays, which
+   * disappear along with the row that holds them).
+   */
+  deleteScanAuditTrail(scanId: string): void {
+    this.store.deleteReviewEventsByScan(scanId);
+    this.store.deleteFindingsByScan(scanId);
+    this.store.deleteAnalysisRunsByScan(scanId);
+    this.store.deleteEvidenceByScan(scanId);
   }
 
   private assertEvidenceBelongsToScan(

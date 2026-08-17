@@ -132,6 +132,41 @@ export const QUEUE_BATCH_LIMIT = 20;
 /** How soon to re-check the queue when work remains after a pass. */
 export const QUEUE_RETRY_DELAY_SECONDS = 30;
 
+// -- Public intake retention (owner decision, see public-intake-retention.ts) --
+//
+// Public ReelScan inquiry records must be deleted no later than 90 days
+// after the original submission date (created_at, never updated_at — an
+// internal scan/status change must not silently extend retention). If a
+// business later becomes a customer, information genuinely needed for that
+// relationship is handled separately under its own future retention rules;
+// the original public-intake record does not need to remain indefinitely.
+export const PUBLIC_INTAKE_RETENTION_DAYS = 90;
+
+/**
+ * How many expired rows one cleanup pass deletes. A bound, not the real
+ * backlog size — an unexpectedly large backlog (e.g. after this feature
+ * first ships) is worked off over multiple scheduled passes rather than
+ * attempting an unbounded delete in one Durable Object alarm tick. Mirrors
+ * QUEUE_BATCH_LIMIT's role for the scan queue above.
+ */
+export const RETENTION_CLEANUP_BATCH_LIMIT = 200;
+
+/**
+ * Once-daily cron (agents SDK, SQLite-backed — see sales-agent.ts's
+ * onStart()). 03:17 UTC: off-peak, and deliberately not a round number
+ * (":00"/":30") so this doesn't line up with other scheduled-task minute
+ * boundaries if any are ever added.
+ */
+export const RETENTION_CLEANUP_CRON = "17 3 * * *";
+
+/**
+ * If a cleanup pass fills its RETENTION_CLEANUP_BATCH_LIMIT batch (more
+ * expired rows may remain), re-check this soon after rather than waiting
+ * for tomorrow's cron tick — mirrors QUEUE_RETRY_DELAY_SECONDS's role for
+ * the scan queue above.
+ */
+export const RETENTION_CLEANUP_CONTINUATION_DELAY_SECONDS = 120;
+
 export const TURNSTILE_ACTION = "reelscan_intake";
 export const TURNSTILE_ALLOWED_HOSTNAMES = [
   "reelhaus.de",

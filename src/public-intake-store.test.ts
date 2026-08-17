@@ -420,3 +420,55 @@ describe("InMemoryPublicIntakeStore — rate limit windows", () => {
     expect(store.getRateLimitWindow("fresh")).not.toBeNull();
   });
 });
+
+describe("InMemoryPublicIntakeStore — retention primitives", () => {
+  it("lists only requests at-or-before the cutoff, oldest first", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(record({ id: "old", createdAt: "2026-01-01T00:00:00.000Z" }));
+    store.insertRequest(record({ id: "newer-old", createdAt: "2026-02-01T00:00:00.000Z" }));
+    store.insertRequest(record({ id: "recent", createdAt: "2026-08-01T00:00:00.000Z" }));
+    const expired = store.listExpiredRequests("2026-03-01T00:00:00.000Z", 10);
+    expect(expired.map((r) => r.id)).toEqual(["old", "newer-old"]);
+  });
+
+  it("includes a row exactly at the cutoff (inclusive boundary)", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(record({ id: "exact", createdAt: "2026-01-01T00:00:00.000Z" }));
+    const expired = store.listExpiredRequests("2026-01-01T00:00:00.000Z", 10);
+    expect(expired.map((r) => r.id)).toEqual(["exact"]);
+  });
+
+  it("respects the batch limit", () => {
+    const store = new InMemoryPublicIntakeStore();
+    for (let i = 0; i < 5; i++)
+      store.insertRequest(record({ id: `r${i}`, createdAt: "2026-01-01T00:00:00.000Z" }));
+    expect(store.listExpiredRequests("2026-06-01T00:00:00.000Z", 3)).toHaveLength(3);
+  });
+
+  it("carries scanId through so the caller can check reference-safety", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(
+      record({ id: "a", createdAt: "2026-01-01T00:00:00.000Z", scanId: "scan-x" })
+    );
+    expect(store.listExpiredRequests("2026-06-01T00:00:00.000Z", 10)).toEqual([
+      { id: "a", scanId: "scan-x" }
+    ]);
+  });
+
+  it("deleteRequest permanently removes the row", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(record({ id: "gone" }));
+    store.deleteRequest("gone");
+    expect(store.getRequest("gone")).toBeNull();
+  });
+
+  it("countRequestsReferencingScan counts across every request status, not just completed ones", () => {
+    const store = new InMemoryPublicIntakeStore();
+    store.insertRequest(record({ id: "a", scanId: "scan-x", requestStatus: "scan_ready_needs_review" }));
+    store.insertRequest(record({ id: "b", scanId: "scan-x", requestStatus: "analysis_failed" }));
+    store.insertRequest(record({ id: "c", scanId: "scan-y" }));
+    expect(store.countRequestsReferencingScan("scan-x")).toBe(2);
+    expect(store.countRequestsReferencingScan("scan-y")).toBe(1);
+    expect(store.countRequestsReferencingScan("scan-none")).toBe(0);
+  });
+});

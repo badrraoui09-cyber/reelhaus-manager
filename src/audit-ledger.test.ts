@@ -373,3 +373,84 @@ describe("scan audit trail", () => {
     expect(trail.findings).toHaveLength(0);
   });
 });
+
+describe("deleteScanAuditTrail (retention)", () => {
+  function fullTrail(ledger: AuditLedgerService, scanId: string) {
+    const evidence = ledger.recordEvidence(evidenceInput({ scanId }));
+    const run = ledger.startAiAnalysisRun({
+      scanId,
+      provider: "cloudflare-workers-ai",
+      model: "@cf/meta/llama-3.2-1b-instruct",
+      promptVersion: "reelscan-v1",
+      schemaVersion: "reelscan-findings-v1",
+      evidenceIds: [evidence.id]
+    });
+    ledger.completeAiAnalysisRun(run.id, { status: "completed" });
+    const finding = ledger.recordFinding({
+      scanId,
+      analysisRunId: run.id,
+      kind: "issue",
+      title: "No reservation CTA",
+      category: "guest_decision",
+      severity: "important",
+      priority: 2,
+      summary: "x",
+      evidenceIds: [evidence.id]
+    });
+    const review = ledger.recordReviewEvent({
+      findingId: finding.id,
+      action: "accepted",
+      reviewer: "reviewer@reelhaus.de"
+    });
+    return { evidence, run, finding, review };
+  }
+
+  it("deletes every row of a scan's audit trail — evidence, analysis runs, findings, review events", () => {
+    const ledger = service();
+    fullTrail(ledger, "scan-1");
+    ledger.deleteScanAuditTrail("scan-1");
+    const trail = ledger.getScanAuditTrail("scan-1");
+    expect(trail.evidence).toEqual([]);
+    expect(trail.analysisRuns).toEqual([]);
+    expect(trail.findings).toEqual([]);
+    expect(trail.reviewEvents).toEqual([]);
+  });
+
+  it("never touches an unrelated scan's audit trail (e.g. Client #0)", () => {
+    const ledger = service();
+    fullTrail(ledger, "scan-1");
+    const clientZero = fullTrail(ledger, "client-zero-scan");
+    ledger.deleteScanAuditTrail("scan-1");
+    const trail = ledger.getScanAuditTrail("client-zero-scan");
+    expect(trail.evidence).toEqual([clientZero.evidence]);
+    expect(trail.findings).toEqual([clientZero.finding]);
+    expect(trail.analysisRuns.map((r) => r.id)).toEqual([clientZero.run.id]);
+    expect(trail.reviewEvents).toEqual([clientZero.review]);
+  });
+
+  it("deletes review events before/with the findings they reference — no orphaned review event survives", () => {
+    const ledger = service();
+    fullTrail(ledger, "scan-1");
+    ledger.deleteScanAuditTrail("scan-1");
+    // If review events were deleted out of order (or not at all), this would
+    // still find a row whose finding_id points at a finding that no longer
+    // exists — getScanAuditTrail's JOIN semantics on the real Sql store, and
+    // the finding-id-set filter on the InMemory store, both make an orphan
+    // structurally invisible here, which is exactly what "no orphaned rows"
+    // requires.
+    expect(ledger.getScanAuditTrail("scan-1").reviewEvents).toEqual([]);
+  });
+
+  it("is safe to call on a scanId with no audit trail at all", () => {
+    const ledger = service();
+    expect(() => ledger.deleteScanAuditTrail("never-existed")).not.toThrow();
+  });
+
+  it("running it twice in a row is a safe no-op the second time", () => {
+    const ledger = service();
+    fullTrail(ledger, "scan-1");
+    ledger.deleteScanAuditTrail("scan-1");
+    expect(() => ledger.deleteScanAuditTrail("scan-1")).not.toThrow();
+    expect(ledger.getScanAuditTrail("scan-1").evidence).toEqual([]);
+  });
+});

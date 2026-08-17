@@ -163,6 +163,36 @@ export interface PublicIntakeStore {
     windowSeconds: number
   ): void;
   purgeStaleRateLimitWindows(nowSeconds: number, windowSeconds: number): void;
+
+  /**
+   * Retention (see public-intake-retention.ts): oldest-first, bounded list
+   * of requests whose created_at is at-or-before cutoffIso — deliberately
+   * created_at, never updated_at, so an internal status change can't
+   * silently extend how long a row survives. Every request status is
+   * eligible, including stuck/broken ones (queued_for_scan, scanning,
+   * analysis_failed, needs_target_review) — a broken request must not
+   * become immortal just because it never reached a "normal" terminal
+   * state. Returns only what deletion needs: the id, and the scanId (if
+   * any) so the caller can check reference-safety before touching the
+   * scan's audit trail.
+   */
+  listExpiredRequests(
+    cutoffIso: string,
+    limit: number
+  ): { id: string; scanId?: string }[];
+
+  /** Retention: permanently removes the request row (and every personal field on it) from storage. */
+  deleteRequest(id: string): void;
+
+  /**
+   * Retention reference-safety: how many inbound_requests rows (across ALL
+   * statuses, not just completed ones) still reference this scanId. A scan
+   * result can be reused across multiple requests (see
+   * normalizeScanReuseKey) — the caller must only delete a scan's audit
+   * trail once this returns 0, i.e. after the LAST referencing request has
+   * itself been deleted.
+   */
+  countRequestsReferencingScan(scanId: string): number;
 }
 
 export class InMemoryPublicIntakeStore implements PublicIntakeStore {
@@ -322,6 +352,28 @@ export class InMemoryPublicIntakeStore implements PublicIntakeStore {
     for (const [key, window] of this.rateLimitWindows.entries())
       if (nowSeconds - window.windowStartSeconds >= windowSeconds * 2)
         this.rateLimitWindows.delete(key);
+  }
+
+  listExpiredRequests(
+    cutoffIso: string,
+    limit: number
+  ): { id: string; scanId?: string }[] {
+    const cutoffMs = Date.parse(cutoffIso);
+    return [...this.requests.values()]
+      .filter((record) => Date.parse(record.createdAt) <= cutoffMs)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .slice(0, limit)
+      .map((record) => ({ id: record.id, scanId: record.scanId }));
+  }
+
+  deleteRequest(id: string): void {
+    this.requests.delete(id);
+  }
+
+  countRequestsReferencingScan(scanId: string): number {
+    return [...this.requests.values()].filter(
+      (record) => record.scanId === scanId
+    ).length;
   }
 }
 
@@ -662,5 +714,40 @@ export class SqlPublicIntakeStore implements PublicIntakeStore {
       nowSeconds,
       windowSeconds * 2
     );
+  }
+
+  listExpiredRequests(
+    cutoffIso: string,
+    limit: number
+  ): { id: string; scanId?: string }[] {
+    // created_at is an ISO-8601 "Z" string throughout this table, so plain
+    // string comparison sorts/filters identically to numeric millisecond
+    // comparison — same convention as recoverStaleScanningRows() above.
+    return this.sql
+      .exec<{ id: string; scan_id: string | null }>(
+        `SELECT id, scan_id FROM inbound_requests
+         WHERE created_at <= ? ORDER BY created_at ASC LIMIT ?`,
+        cutoffIso,
+        limit
+      )
+      .toArray()
+      .map((row) => ({
+        id: String(row.id),
+        scanId: row.scan_id ? String(row.scan_id) : undefined
+      }));
+  }
+
+  deleteRequest(id: string): void {
+    this.sql.exec("DELETE FROM inbound_requests WHERE id = ?", id);
+  }
+
+  countRequestsReferencingScan(scanId: string): number {
+    const row = this.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM inbound_requests WHERE scan_id = ?",
+        scanId
+      )
+      .toArray()[0];
+    return Number(row?.count || 0);
   }
 }

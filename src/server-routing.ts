@@ -46,7 +46,8 @@ const API_ROUTES: ReadonlyArray<{
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/reject$/ },
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/send$/ },
   { method: "POST", pathname: /^\/api\/assistant$/ },
-  { method: "GET", pathname: /^\/api\/inbound-requests$/ }
+  { method: "GET", pathname: /^\/api\/inbound-requests$/ },
+  { method: "GET", pathname: /^\/api\/inbound-retention\/status$/ }
 ];
 
 // The exact one route/method pair allowed to bypass Cloudflare Access — a
