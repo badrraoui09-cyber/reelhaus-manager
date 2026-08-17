@@ -25,7 +25,7 @@ import { analyzeReelHaus, type AuditReport, type Severity } from "./website-anal
 
 // Centralized so the model/version can change later without touching the
 // pipeline that calls it.
-export const REELSCAN_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+export const REELSCAN_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8";
 export const REELSCAN_PROMPT_VERSION = "reelscan-v1";
 export const REELSCAN_SCHEMA_VERSION = "reelscan-findings-v1";
 export const REELSCAN_AI_TIMEOUT_MS = 30_000;
