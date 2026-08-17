@@ -31,6 +31,12 @@ export interface AiChatMessage {
 export interface AiChatOptions {
   temperature?: number;
   maxTokens?: number;
+  /**
+   * Best-effort request for constrained output (e.g. `{ type: "json_object" }`).
+   * Not every model enforces this — callers that need guaranteed structure
+   * must still validate the parsed response themselves.
+   */
+  responseFormat?: { type: string; json_schema?: unknown };
 }
 
 export interface AiTextPromptResult {
@@ -103,7 +109,8 @@ export class WorkersAiService {
       {
         messages,
         temperature: options.temperature,
-        max_tokens: options.maxTokens
+        max_tokens: options.maxTokens,
+        response_format: options.responseFormat
       },
       timeoutMs
     );

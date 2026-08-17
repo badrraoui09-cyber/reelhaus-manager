@@ -41,10 +41,13 @@ export interface AiAnalysisRun {
   error: string | null;
 }
 
+export type FindingKind = "strength" | "issue";
+
 export interface FindingRecord {
   id: string;
   scanId: string;
   analysisRunId: string | null;
+  kind: FindingKind;
   title: string;
   category: string;
   severity: Severity;
@@ -226,6 +229,7 @@ function mapFindingRow(row: SqlRow): FindingRecord {
     id: String(row.id),
     scanId: String(row.scan_id),
     analysisRunId: row.analysis_run_id ? String(row.analysis_run_id) : null,
+    kind: String(row.kind || "issue") as FindingKind,
     title: String(row.title),
     category: String(row.category),
     severity: String(row.severity) as Severity,
@@ -284,7 +288,7 @@ export class SqlAuditLedgerStore implements AuditLedgerStore {
       );
       CREATE TABLE IF NOT EXISTS audit_findings (
         id TEXT PRIMARY KEY, scan_id TEXT NOT NULL,
-        analysis_run_id TEXT,
+        analysis_run_id TEXT, kind TEXT NOT NULL DEFAULT 'issue',
         title TEXT NOT NULL, category TEXT NOT NULL,
         severity TEXT NOT NULL, priority INTEGER NOT NULL,
         summary TEXT NOT NULL, evidence_ids_json TEXT NOT NULL,
@@ -397,12 +401,14 @@ export class SqlAuditLedgerStore implements AuditLedgerStore {
   insertFinding(record: FindingRecord): void {
     this.sql.exec(
       `INSERT INTO audit_findings (
-        id, scan_id, analysis_run_id, title, category, severity, priority,
-        summary, evidence_ids_json, confidence, score_impact, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, scan_id, analysis_run_id, kind, title, category, severity,
+        priority, summary, evidence_ids_json, confidence, score_impact,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       record.id,
       record.scanId,
       record.analysisRunId,
+      record.kind,
       record.title,
       record.category,
       record.severity,

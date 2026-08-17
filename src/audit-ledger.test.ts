@@ -125,6 +125,7 @@ describe("findings", () => {
     const finding = ledger.recordFinding({
       scanId: "scan-1",
       analysisRunId: null,
+      kind: "issue",
       title: "No reservation CTA",
       category: "guest_decision",
       severity: "important",
@@ -142,6 +143,7 @@ describe("findings", () => {
       ledger.recordFinding({
         scanId: "scan-1",
         analysisRunId: null,
+        kind: "issue",
         title: "No reservation CTA",
         category: "guest_decision",
         severity: "important",
@@ -158,6 +160,7 @@ describe("findings", () => {
       ledger.recordFinding({
         scanId: "scan-1",
         analysisRunId: null,
+        kind: "issue",
         title: "No reservation CTA",
         category: "guest_decision",
         severity: "important",
@@ -177,6 +180,7 @@ describe("findings", () => {
       ledger.recordFinding({
         scanId: "scan-1",
         analysisRunId: null,
+        kind: "issue",
         title: "No reservation CTA",
         category: "guest_decision",
         severity: "important",
@@ -201,6 +205,7 @@ describe("findings", () => {
     const finding = ledger.recordFinding({
       scanId: "scan-1",
       analysisRunId: run.id,
+      kind: "issue",
       title: "No reservation CTA",
       category: "guest_decision",
       severity: "important",
@@ -229,6 +234,7 @@ describe("findings", () => {
       ledger.recordFinding({
         scanId: "scan-1",
         analysisRunId: run.id,
+        kind: "issue",
         title: "Menu link broken",
         category: "guest_decision",
         severity: "important",
@@ -257,6 +263,7 @@ describe("findings", () => {
       ledger.recordFinding({
         scanId: "scan-1",
         analysisRunId: runOnScan2.id,
+        kind: "issue",
         title: "Cross-scan finding",
         category: "guest_decision",
         severity: "important",
@@ -275,6 +282,7 @@ describe("review events", () => {
     const finding = ledger.recordFinding({
       scanId: "scan-1",
       analysisRunId: null,
+      kind: "issue",
       title: "No reservation CTA",
       category: "guest_decision",
       severity: "important",
@@ -322,6 +330,7 @@ describe("scan audit trail", () => {
     const finding = ledger.recordFinding({
       scanId: "scan-1",
       analysisRunId: run.id,
+      kind: "issue",
       title: "No reservation CTA",
       category: "guest_decision",
       severity: "important",
@@ -350,6 +359,7 @@ describe("scan audit trail", () => {
     ledger.recordFinding({
       scanId: "scan-1",
       analysisRunId: null,
+      kind: "issue",
       title: "x",
       category: "guest_decision",
       severity: "optional",

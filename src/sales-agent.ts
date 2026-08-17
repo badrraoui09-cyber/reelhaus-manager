@@ -2,6 +2,7 @@ import { Agent } from "agents";
 import { checkAiHealth } from "./ai-service";
 import { AuditLedgerService, SqlAuditLedgerStore } from "./audit-ledger";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
+import { runReelScanV1ClientZero } from "./reelscan";
 import {
   BusinessAssistantAgent,
   EmailReviewAgent,
@@ -362,6 +363,11 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
     try {
       if (request.method === "POST" && url.pathname === "/scan")
         return await this.runGuardianScan();
+      if (
+        request.method === "POST" &&
+        url.pathname === "/reelscan/v1/client-zero"
+      )
+        return await this.triggerReelScanV1ClientZero();
       if (request.method === "GET" && url.pathname === "/ai/health")
         return await this.aiHealthCheck();
       if (
@@ -2905,6 +2911,11 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
 
   private async runGuardianScan() {
     const report = await analyzeReelHaus(fetch);
+    this.persistGuardianReport(report);
+    return json(report, 201);
+  }
+
+  private persistGuardianReport(report: AuditReport) {
     this.ctx.storage.sql.exec(
       "INSERT INTO reports VALUES (?, ?, ?, ?)",
       report.id,
@@ -2912,7 +2923,29 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       JSON.stringify(report.summary),
       JSON.stringify(report)
     );
-    return json(report, 201);
+  }
+
+  private async triggerReelScanV1ClientZero() {
+    const { result, report } = await runReelScanV1ClientZero({
+      ai: this.env.AI,
+      auditLedger: this.auditLedger,
+      fetcher: fetch
+    });
+    this.persistGuardianReport(report);
+    this.recordActivity(
+      null,
+      "system:reelscan-v1",
+      "reelscan_v1.client_zero_scanned",
+      {
+        scanId: result.scanId,
+        evidenceCount: result.evidence.length,
+        findingCount: result.findings.length,
+        analysisRunStatus: result.analysisRun.status,
+        recommendedAction: result.recommendation.action,
+        reviewStatus: result.reviewStatus
+      }
+    );
+    return json(result, 201);
   }
 
   private listReports() {

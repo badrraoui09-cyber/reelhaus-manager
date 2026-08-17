@@ -5,6 +5,7 @@ const API_ROUTES: ReadonlyArray<{
   { method: "GET", pathname: /^\/api\/auth\/diagnostic$/ },
   { method: "GET", pathname: /^\/api\/ai\/health$/ },
   { method: "GET", pathname: /^\/api\/audit\/scans\/[^/]+$/ },
+  { method: "POST", pathname: /^\/api\/reelscan\/v1\/client-zero$/ },
   { method: "POST", pathname: /^\/api\/scan$/ },
   { method: "GET", pathname: /^\/api\/reports$/ },
   { method: "GET", pathname: /^\/api\/reports\/[^/]+$/ },

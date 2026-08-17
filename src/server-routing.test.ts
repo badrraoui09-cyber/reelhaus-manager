@@ -6,6 +6,9 @@ describe("Worker route classification", () => {
     expect(isKnownApiRoute("GET", "/api/auth/diagnostic")).toBe(true);
     expect(isKnownApiRoute("GET", "/api/ai/health")).toBe(true);
     expect(isKnownApiRoute("GET", "/api/audit/scans/scan-1")).toBe(true);
+    expect(isKnownApiRoute("POST", "/api/reelscan/v1/client-zero")).toBe(
+      true
+    );
     expect(isKnownApiRoute("GET", "/api/sales")).toBe(true);
     expect(isKnownApiRoute("GET", "/api/businesses/search")).toBe(true);
     expect(isKnownApiRoute("GET", "/api/businesses/business-1/workspace")).toBe(
