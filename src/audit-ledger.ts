@@ -41,7 +41,17 @@ export interface AiAnalysisRun {
   error: string | null;
 }
 
-export type FindingKind = "strength" | "issue";
+// "note" = a deterministic downgrade of an AI "issue" whose only backing
+// evidence was unverified/inferential — preserved for the audit trail but
+// never scored. See reelscan.ts downgradeUncertainIssues().
+export type FindingKind = "strength" | "issue" | "note";
+
+// Defect severity applies to "issue" findings. A "strength" finding is
+// never a defect, so it carries `impact` instead and `severity: null` —
+// a persisted `{kind:"strength", severity:"critical"}` would read as a
+// critical *problem* to anyone looking at the raw record, which is
+// exactly the confusion this separation avoids.
+export type FindingImpact = "high" | "medium" | "low";
 
 export interface FindingRecord {
   id: string;
@@ -50,7 +60,8 @@ export interface FindingRecord {
   kind: FindingKind;
   title: string;
   category: string;
-  severity: Severity;
+  severity: Severity | null;
+  impact?: FindingImpact;
   priority: number;
   summary: string;
   evidenceIds: string[];
@@ -224,7 +235,14 @@ function mapAnalysisRunRow(row: SqlRow): AiAnalysisRun {
   };
 }
 
+// SQLite can't cheaply relax an existing NOT NULL column on a table that's
+// already live with data, so `severity` stays NOT NULL at the DB layer and
+// "not applicable" (strength findings) is stored as this reserved sentinel
+// instead of a real ALTER-TABLE migration.
+const NO_SEVERITY_SENTINEL = "n/a";
+
 function mapFindingRow(row: SqlRow): FindingRecord {
+  const severity = String(row.severity);
   return {
     id: String(row.id),
     scanId: String(row.scan_id),
@@ -232,7 +250,8 @@ function mapFindingRow(row: SqlRow): FindingRecord {
     kind: String(row.kind || "issue") as FindingKind,
     title: String(row.title),
     category: String(row.category),
-    severity: String(row.severity) as Severity,
+    severity: severity === NO_SEVERITY_SENTINEL ? null : (severity as Severity),
+    impact: row.impact ? (String(row.impact) as FindingImpact) : undefined,
     priority: Number(row.priority),
     summary: String(row.summary),
     evidenceIds: JSON.parse(String(row.evidence_ids_json || "[]")),
@@ -267,6 +286,20 @@ function mapReviewEventRow(row: SqlRow): FindingReviewEvent {
 export class SqlAuditLedgerStore implements AuditLedgerStore {
   constructor(private readonly sql: SqlExecutor) {
     this.ensureSchema();
+    // `CREATE TABLE IF NOT EXISTS` is a no-op against the table Task #3
+    // already deployed to production (Client #0's first successful scan).
+    // Backfill new columns the same idempotent way sales-agent.ts already
+    // does for discovery_candidates.
+    this.ensureColumn("audit_findings", "impact", "TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const exists = this.sql
+      .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+      .toArray()
+      .some((row) => row.name === column);
+    if (!exists)
+      this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   private ensureSchema(): void {
@@ -290,7 +323,7 @@ export class SqlAuditLedgerStore implements AuditLedgerStore {
         id TEXT PRIMARY KEY, scan_id TEXT NOT NULL,
         analysis_run_id TEXT, kind TEXT NOT NULL DEFAULT 'issue',
         title TEXT NOT NULL, category TEXT NOT NULL,
-        severity TEXT NOT NULL, priority INTEGER NOT NULL,
+        severity TEXT NOT NULL, impact TEXT, priority INTEGER NOT NULL,
         summary TEXT NOT NULL, evidence_ids_json TEXT NOT NULL,
         confidence TEXT, score_impact REAL,
         created_at TEXT NOT NULL,
@@ -402,16 +435,17 @@ export class SqlAuditLedgerStore implements AuditLedgerStore {
     this.sql.exec(
       `INSERT INTO audit_findings (
         id, scan_id, analysis_run_id, kind, title, category, severity,
-        priority, summary, evidence_ids_json, confidence, score_impact,
-        created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        impact, priority, summary, evidence_ids_json, confidence,
+        score_impact, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       record.id,
       record.scanId,
       record.analysisRunId,
       record.kind,
       record.title,
       record.category,
-      record.severity,
+      record.severity ?? NO_SEVERITY_SENTINEL,
+      record.impact ?? null,
       record.priority,
       record.summary,
       JSON.stringify(record.evidenceIds),

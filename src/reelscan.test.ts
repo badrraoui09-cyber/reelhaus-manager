@@ -5,16 +5,24 @@ import {
   REELSCAN_AI_TIMEOUT_MS,
   REELSCAN_JSON_SCHEMA,
   REELSCAN_MODEL,
+  REELSCAN_SEVERITY_DEDUCTIONS,
   ReelScanValidationError,
   buildReelScanPrompt,
   calculateReelScanScore,
   collectClientZeroContentEvidence,
+  confidenceBucket,
+  consolidateFindings,
+  deriveDeterministicFindings,
+  downgradeUncertainIssues,
+  findingOrigin,
   parseReelScanAiResponse,
   recommendReelScanAction,
   runReelScanV1ClientZero,
-  technicalEvidenceFromGuardianReport
+  scoreImpactFor,
+  technicalEvidenceFromGuardianReport,
+  type ValidatedReelScanFinding
 } from "./reelscan";
-import type { FindingRecord } from "./audit-ledger";
+import type { EvidenceRecord, FindingRecord } from "./audit-ledger";
 import type { AuditReport } from "./website-analysis";
 
 const FR_HTML = `<!DOCTYPE html>
@@ -82,7 +90,22 @@ function fakeAi(run: WorkersAiBinding["run"]): WorkersAiBinding {
   return { run };
 }
 
-function validAiPayload(evidenceIds: string[]) {
+interface FakeEvidenceItem {
+  id: string;
+  observationType: string;
+}
+
+// Deliberately cites content evidence (page_title / meta_description),
+// never Guardian evidence — Website Guardian's HTMLRewriter-based parsing
+// isn't available in plain Node/vitest (only real Cloudflare Workers), so
+// analyzeReelHaus() always fails both target pages here and deterministic
+// injection always adds its own consolidated finding on top (see the
+// dedicated "Website Guardian evidence" tests below). Keeping the AI
+// fixture's citations independent of that keeps these tests about the AI
+// pipeline, not about the Node test environment's HTMLRewriter gap.
+function validAiPayload(evidencePayload: FakeEvidenceItem[]) {
+  const byType = (type: string) =>
+    evidencePayload.find((item) => item.observationType === type)!.id;
   return {
     findings: [
       {
@@ -92,7 +115,7 @@ function validAiPayload(evidenceIds: string[]) {
         priority: 2,
         summary:
           "The homepage hero area does not present a clear next action for a visitor.",
-        evidenceIds: [evidenceIds[0]],
+        evidenceIds: [byType("page_title")],
         confidence: 0.8,
         kind: "issue"
       },
@@ -102,7 +125,7 @@ function validAiPayload(evidenceIds: string[]) {
         severity: "optional",
         priority: 4,
         summary: "ReelFix, ReelBuild and ReelCare are all named on the page.",
-        evidenceIds: evidenceIds.slice(0, 2),
+        evidenceIds: [byType("page_title"), byType("meta_description")],
         confidence: 0.7,
         kind: "strength"
       }
@@ -111,14 +134,23 @@ function validAiPayload(evidenceIds: string[]) {
 }
 
 // Workers AI can return `.response` as a JSON string...
-function validAiJson(evidenceIds: string[]): string {
-  return JSON.stringify(validAiPayload(evidenceIds));
+function validAiJson(evidencePayload: FakeEvidenceItem[]): string {
+  return JSON.stringify(validAiPayload(evidencePayload));
 }
 
 // ...or, under JSON Schema mode, as an already-parsed object — the real
 // Client #0 failure this fix addresses.
-function validAiObject(evidenceIds: string[]) {
-  return validAiPayload(evidenceIds);
+function validAiObject(evidencePayload: FakeEvidenceItem[]) {
+  return validAiPayload(evidencePayload);
+}
+
+function evidencePayloadFromPrompt(inputs: {
+  messages?: unknown;
+}): FakeEvidenceItem[] {
+  const messages = inputs.messages as Array<{ content: string }>;
+  return JSON.parse(
+    messages[1].content.match(/Evidence.*:\n(\[.*\])\n\n/s)![1]
+  ) as FakeEvidenceItem[];
 }
 
 function fakeReport(): AuditReport {
@@ -221,10 +253,15 @@ describe("prompt construction", () => {
   });
 });
 
+const FAKE_EVIDENCE_PAYLOAD: FakeEvidenceItem[] = [
+  { id: "ev-1", observationType: "page_title" },
+  { id: "ev-2", observationType: "meta_description" }
+];
+
 describe("AI output validation", () => {
   it("accepts well-formed structured output", () => {
     const validated = parseReelScanAiResponse(
-      validAiJson(["ev-1", "ev-2"]),
+      validAiJson(FAKE_EVIDENCE_PAYLOAD),
       new Set(["ev-1", "ev-2"])
     );
     expect(validated).toHaveLength(2);
@@ -234,7 +271,7 @@ describe("AI output validation", () => {
 
   it("accepts an already-parsed object response (Workers AI JSON Schema mode)", () => {
     const validated = parseReelScanAiResponse(
-      validAiObject(["ev-1", "ev-2"]),
+      validAiObject(FAKE_EVIDENCE_PAYLOAD),
       new Set(["ev-1", "ev-2"])
     );
     expect(validated).toHaveLength(2);
@@ -360,16 +397,9 @@ describe("AI output validation", () => {
 describe("runReelScanV1ClientZero orchestration", () => {
   it("completes the analysis run and persists validated findings on success", async () => {
     const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
-    const ai = fakeAi(async (model, inputs) => {
-      const evidence = (
-        JSON.parse(
-          (inputs.messages as Array<{ content: string }>)[1].content.match(
-            /Evidence.*:\n(\[.*\])\n\n/s
-          )![1]
-        ) as Array<{ id: string }>
-      ).map((item) => item.id);
-      return { response: validAiJson(evidence) };
-    });
+    const ai = fakeAi(async (model, inputs) => ({
+      response: validAiJson(evidencePayloadFromPrompt(inputs))
+    }));
 
     const { result } = await runReelScanV1ClientZero({
       ai,
@@ -379,28 +409,36 @@ describe("runReelScanV1ClientZero orchestration", () => {
 
     expect(result.analysisRun.status).toBe("completed");
     expect(result.evidence.length).toBeGreaterThan(0);
-    expect(result.findings.length).toBe(2);
     expect(result.reviewStatus).toBe("needs_review");
     expect(result.score?.score).toBeLessThan(100);
 
+    // The 2 AI findings, plus Website Guardian's own deterministic finding
+    // (analyzeReelHaus() has no HTMLRewriter outside real Cloudflare
+    // Workers, so it always fails both target pages here — deterministic
+    // injection correctly surfaces that as one consolidated FR+AR finding
+    // instead of silently dropping it; see the dedicated deterministic-
+    // injection tests below for the calibration behavior in isolation).
+    expect(result.findings.length).toBe(3);
+    const aiFindings = result.findings.filter(
+      (finding) => findingOrigin(finding) === "ai"
+    );
+    const deterministicFindings = result.findings.filter(
+      (finding) => findingOrigin(finding) === "deterministic"
+    );
+    expect(aiFindings).toHaveLength(2);
+    expect(deterministicFindings).toHaveLength(1);
+
     const trail = ledger.getScanAuditTrail(result.scanId);
     expect(trail.evidence.length).toBe(result.evidence.length);
-    expect(trail.findings.length).toBe(2);
+    expect(trail.findings.length).toBe(3);
   });
 
   it("completes successfully when Workers AI returns an already-parsed structured object — the real Client #0 regression", async () => {
     const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
-    const ai = fakeAi(async (_model, inputs) => {
-      const evidence = (
-        JSON.parse(
-          (inputs.messages as Array<{ content: string }>)[1].content.match(
-            /Evidence.*:\n(\[.*\])\n\n/s
-          )![1]
-        ) as Array<{ id: string }>
-      ).map((item) => item.id);
+    const ai = fakeAi(async (_model, inputs) => ({
       // Workers AI JSON Schema mode: `.response` is an object, not a string.
-      return { response: validAiObject(evidence) };
-    });
+      response: validAiObject(evidencePayloadFromPrompt(inputs))
+    }));
 
     const { result } = await runReelScanV1ClientZero({
       ai,
@@ -409,7 +447,7 @@ describe("runReelScanV1ClientZero orchestration", () => {
     });
 
     expect(result.analysisRun.status).toBe("completed");
-    expect(result.findings.length).toBe(2);
+    expect(result.findings.filter((f) => findingOrigin(f) === "ai")).toHaveLength(2);
     expect(result.reviewStatus).toBe("needs_review");
     expect(result.recommendation).not.toBeNull();
   });
@@ -474,7 +512,13 @@ describe("runReelScanV1ClientZero orchestration", () => {
     expect(result.findings).toHaveLength(0);
   });
 
-  it("a genuinely successful run with zero AI-found issues still legitimately reports no_immediate_change", async () => {
+  it("an AI-empty result still surfaces Website Guardian's own deterministic finding rather than reporting zero", async () => {
+    // Problem 4 regression at the orchestration level: even when the AI
+    // finds literally nothing, a verified important/critical Guardian
+    // defect must not vanish. (analyzeReelHaus() has no HTMLRewriter
+    // outside real Cloudflare Workers, so it deterministically fails both
+    // target pages here — a real, verified, critical "issue" by
+    // construction.)
     const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
     const ai = fakeAi(async () => ({ response: JSON.stringify({ findings: [] }) }));
 
@@ -485,10 +529,27 @@ describe("runReelScanV1ClientZero orchestration", () => {
     });
 
     expect(result.analysisRun.status).toBe("completed");
-    expect(result.findings).toHaveLength(0);
-    expect(result.score?.score).toBe(100);
-    expect(result.recommendation?.action).toBe("no_immediate_change");
+    expect(
+      result.findings.filter((finding) => findingOrigin(finding) === "ai")
+    ).toHaveLength(0);
+    expect(
+      result.findings.filter(
+        (finding) => findingOrigin(finding) === "deterministic"
+      )
+    ).toHaveLength(1);
     expect(result.reviewStatus).toBe("needs_review");
+    // A real verified critical defect must drive a real recommendation —
+    // not the AI-empty no_immediate_change Problem 4 exists to prevent.
+    expect(result.recommendation?.action).not.toBe("no_immediate_change");
+  });
+
+  it("a truly clean result (no findings at all) legitimately reports no_immediate_change", () => {
+    // The orchestration-level test above can't reach a truly empty finding
+    // set in this Node test environment (Website Guardian always produces
+    // its own deterministic finding here — see above). This pins the pure
+    // decision the orchestrator relies on: genuinely zero findings really
+    // does mean "nothing to report", not a hidden failure.
+    expect(recommendReelScanAction([]).action).toBe("no_immediate_change");
   });
 
   it("uses ReelScan's own dedicated ~60s timeout for the AI call, not ai-service's short default", async () => {
@@ -614,5 +675,394 @@ describe("Fix-before-Build recommendation", () => {
       finding({ id: "c", severity: "optional" })
     ];
     expect(recommendReelScanAction(findings).action).toBe("ReelCare");
+  });
+});
+
+// -- Task #3D calibration fixes ---------------------------------------------
+
+function guardianEvidence(overrides: Partial<EvidenceRecord> = {}): EvidenceRecord {
+  return {
+    id: "ev-guardian",
+    scanId: "scan-1",
+    sourceType: "html_static",
+    sourceUrl: "https://reelhaus.de/fr/",
+    observationType: "responsive",
+    observation:
+      "Visuelles responsives Layout manuell prüfen: Ein Worker analysiert HTML, rendert aber keine Browser-Viewports.",
+    capturedAt: "2026-08-17T09:00:00.000Z",
+    collector: "website-analysis@analyzeReelHaus",
+    metadata: { severity: "optional", verification: "inference" },
+    ...overrides
+  };
+}
+
+function calFinding(
+  overrides: Partial<ValidatedReelScanFinding> = {}
+): ValidatedReelScanFinding {
+  return {
+    title: "x",
+    category: "technical",
+    severity: "optional",
+    priority: 4,
+    summary: "x",
+    evidenceIds: ["ev-guardian"],
+    confidence: "Low",
+    kind: "issue",
+    ...overrides
+  };
+}
+
+function calRecord(
+  candidate: ValidatedReelScanFinding,
+  overrides: Partial<FindingRecord> = {}
+): FindingRecord {
+  return {
+    id: overrides.id || `f-${Math.random()}`,
+    scanId: "scan-1",
+    analysisRunId: "run-1",
+    kind: candidate.kind,
+    title: candidate.title,
+    category: candidate.category,
+    severity: candidate.kind === "strength" ? null : candidate.severity,
+    priority: candidate.priority,
+    summary: candidate.summary,
+    evidenceIds: candidate.evidenceIds,
+    createdAt: "2026-08-17T09:00:00.000Z",
+    scoreImpact: scoreImpactFor(candidate.kind, candidate.severity),
+    ...overrides
+  };
+}
+
+describe("Problem 1 — uncertainty/manual-review evidence is not a defect", () => {
+  it("downgrades an issue whose only evidence is unverified/inference to a non-scoring note", () => {
+    const evidenceById = new Map([["ev-guardian", guardianEvidence()]]);
+    const [result] = downgradeUncertainIssues([calFinding()], evidenceById);
+    expect(result.kind).toBe("note");
+    expect(scoreImpactFor(result.kind, result.severity)).toBe(0);
+  });
+
+  it("keeps a real issue that is backed by at least one verified fact", () => {
+    const evidenceById = new Map([
+      ["ev-guardian", guardianEvidence()],
+      [
+        "ev-verified",
+        guardianEvidence({
+          id: "ev-verified",
+          metadata: { severity: "critical", verification: "verified" }
+        })
+      ]
+    ]);
+    const finding = calFinding({ evidenceIds: ["ev-guardian", "ev-verified"] });
+    const [result] = downgradeUncertainIssues([finding], evidenceById);
+    expect(result.kind).toBe("issue");
+  });
+
+  it("never downgrades a strength, even one backed only by inference evidence", () => {
+    const evidenceById = new Map([["ev-guardian", guardianEvidence()]]);
+    const [result] = downgradeUncertainIssues(
+      [calFinding({ kind: "strength" })],
+      evidenceById
+    );
+    expect(result.kind).toBe("strength");
+  });
+});
+
+describe("Problem 2 & 5 — deterministic consolidation of duplicate categories/locales", () => {
+  it("consolidates one evidence ID cited under two different categories into one finding", () => {
+    const evidenceById = new Map([["ev-guardian", guardianEvidence()]]);
+    const findings = [
+      calFinding({ category: "technical" }),
+      calFinding({ category: "mobile" })
+    ];
+    const consolidated = consolidateFindings(findings, evidenceById);
+    expect(consolidated).toHaveLength(1);
+  });
+
+  it("consolidates the equivalent FR + AR structural defect into one finding, keeping both evidence IDs", () => {
+    const fr = guardianEvidence({ id: "ev-fr", sourceUrl: "https://reelhaus.de/fr/" });
+    const ar = guardianEvidence({ id: "ev-ar", sourceUrl: "https://reelhaus.de/ar/" });
+    const evidenceById = new Map([
+      [fr.id, fr],
+      [ar.id, ar]
+    ]);
+    const findings = [
+      calFinding({ category: "technical", evidenceIds: [fr.id] }),
+      calFinding({ category: "technical", evidenceIds: [ar.id] }),
+      calFinding({ category: "mobile", evidenceIds: [fr.id] }),
+      calFinding({ category: "mobile", evidenceIds: [ar.id] })
+    ];
+    const consolidated = consolidateFindings(findings, evidenceById);
+    expect(consolidated).toHaveLength(1);
+    expect(consolidated[0].evidenceIds.slice().sort()).toEqual(
+      [fr.id, ar.id].sort()
+    );
+  });
+
+  it("scores the consolidated root problem once, not once per original duplicate", () => {
+    const fr = guardianEvidence({ id: "ev-fr", sourceUrl: "https://reelhaus.de/fr/" });
+    const ar = guardianEvidence({ id: "ev-ar", sourceUrl: "https://reelhaus.de/ar/" });
+    const evidenceById = new Map([
+      [fr.id, fr],
+      [ar.id, ar]
+    ]);
+    const raw = [
+      calFinding({ category: "technical", severity: "optional", evidenceIds: [fr.id] }),
+      calFinding({ category: "technical", severity: "optional", evidenceIds: [ar.id] }),
+      calFinding({ category: "mobile", severity: "optional", evidenceIds: [fr.id] }),
+      calFinding({ category: "mobile", severity: "optional", evidenceIds: [ar.id] })
+    ];
+    const consolidated = consolidateFindings(raw, evidenceById);
+    const persisted = consolidated.map((candidate) => calRecord(candidate));
+    const score = calculateReelScanScore(persisted);
+    expect(score.score).toBe(100 - REELSCAN_SEVERITY_DEDUCTIONS.optional);
+  });
+
+  it("keeps genuinely different findings separate", () => {
+    const heading = guardianEvidence({
+      id: "ev-heading",
+      observationType: "primary_heading",
+      collector: "reelscan-v1@content-evidence"
+    });
+    const action = guardianEvidence({
+      id: "ev-action",
+      observationType: "action_link_signals",
+      collector: "reelscan-v1@content-evidence"
+    });
+    const evidenceById = new Map([
+      [heading.id, heading],
+      [action.id, action]
+    ]);
+    const findings = [
+      calFinding({ kind: "strength", evidenceIds: [heading.id] }),
+      calFinding({ kind: "strength", evidenceIds: [action.id] })
+    ];
+    expect(consolidateFindings(findings, evidenceById)).toHaveLength(2);
+  });
+
+  it("consolidates locale-duplicate strengths while preserving both evidence IDs", () => {
+    const frHeading = guardianEvidence({
+      id: "ev-fr-heading",
+      observationType: "primary_heading",
+      sourceUrl: "https://reelhaus.de/fr/",
+      collector: "reelscan-v1@content-evidence"
+    });
+    const arHeading = guardianEvidence({
+      id: "ev-ar-heading",
+      observationType: "primary_heading",
+      sourceUrl: "https://reelhaus.de/ar/",
+      collector: "reelscan-v1@content-evidence"
+    });
+    const evidenceById = new Map([
+      [frHeading.id, frHeading],
+      [arHeading.id, arHeading]
+    ]);
+    const findings = [
+      calFinding({
+        kind: "strength",
+        title: "Clear Primary Heading",
+        evidenceIds: [frHeading.id]
+      }),
+      calFinding({
+        kind: "strength",
+        title: "Clear Primary Heading (Arabic)",
+        evidenceIds: [arHeading.id]
+      })
+    ];
+    const consolidated = consolidateFindings(findings, evidenceById);
+    expect(consolidated).toHaveLength(1);
+    expect(consolidated[0].evidenceIds.slice().sort()).toEqual(
+      [frHeading.id, arHeading.id].sort()
+    );
+  });
+
+  it("recommendation reacts to the deduplicated count, not the raw duplicate count", () => {
+    const fr = guardianEvidence({ id: "ev-fr", sourceUrl: "https://reelhaus.de/fr/" });
+    const ar = guardianEvidence({ id: "ev-ar", sourceUrl: "https://reelhaus.de/ar/" });
+    const evidenceById = new Map([
+      [fr.id, fr],
+      [ar.id, ar]
+    ]);
+    const raw = [
+      calFinding({ category: "technical", severity: "optional", evidenceIds: [fr.id] }),
+      calFinding({ category: "technical", severity: "optional", evidenceIds: [ar.id] }),
+      calFinding({ category: "mobile", severity: "optional", evidenceIds: [fr.id] }),
+      calFinding({ category: "mobile", severity: "optional", evidenceIds: [ar.id] })
+    ];
+    // Un-consolidated, 4 optional issues would cross the >=3 ReelCare
+    // threshold. Consolidated, it's one issue — below threshold.
+    const consolidated = consolidateFindings(raw, evidenceById);
+    expect(consolidated).toHaveLength(1);
+    const persisted = consolidated.map((candidate) => calRecord(candidate));
+    expect(recommendReelScanAction(persisted).action).not.toBe("ReelCare");
+  });
+});
+
+describe("Problem 3 — action-link evidence distinguishes occurrences from unique destinations", () => {
+  it("reports total occurrences separately from unique destinations, not one collapsed count", async () => {
+    const html = `<!DOCTYPE html><html lang="fr"><head><title>t</title></head><body>
+      <a href="#audit">Commencer l'audit</a>
+      <a href="#audit">Audit gratuit</a>
+      <a href="mailto:hello@reelhaus.de">Contact</a>
+    </body></html>`;
+    const fetcher = (async () =>
+      new Response(html, {
+        status: 200,
+        headers: { "content-type": "text/html" }
+      })) as unknown as typeof fetch;
+    const inputs = await collectClientZeroContentEvidence(fetcher, "scan-1");
+    const actionEvidence = inputs.find(
+      (item) =>
+        item.observationType === "action_link_signals" &&
+        item.sourceUrl === "https://reelhaus.de/fr/"
+    );
+    expect(actionEvidence?.observation).toContain(
+      "3 action-oriented link occurrence(s)"
+    );
+    expect(actionEvidence?.observation).toContain(
+      "resolving to 2 unique destination(s)"
+    );
+    expect(actionEvidence?.observation).toContain("(anchor)");
+    expect(actionEvidence?.observation).toContain("(email)");
+  });
+
+  it("does not report a single clear destination as a low link count when several elements point to it", async () => {
+    const html = `<!DOCTYPE html><html lang="fr"><head><title>t</title></head><body>
+      <a href="#audit">Commencer</a>
+      <a href="#audit">Réserver maintenant</a>
+      <a href="#audit">Demander un devis</a>
+    </body></html>`;
+    const fetcher = (async () =>
+      new Response(html, {
+        status: 200,
+        headers: { "content-type": "text/html" }
+      })) as unknown as typeof fetch;
+    const inputs = await collectClientZeroContentEvidence(fetcher, "scan-1");
+    const actionEvidence = inputs.find(
+      (item) =>
+        item.observationType === "action_link_signals" &&
+        item.sourceUrl === "https://reelhaus.de/fr/"
+    );
+    expect(actionEvidence?.observation).toContain(
+      "3 action-oriented link occurrence(s)"
+    );
+    expect(actionEvidence?.observation).toContain(
+      "resolving to 1 unique destination(s)"
+    );
+    expect(actionEvidence?.observation).toContain("single clear conversion path");
+  });
+});
+
+describe("Problem 4 — verified defects are guaranteed to be considered", () => {
+  const formEvidence = () =>
+    guardianEvidence({
+      id: "ev-form",
+      observationType: "forms",
+      observation:
+        "Formular 1 enthält unbeschriftete Felder: 2 Formularelemente haben keine erkennbare Beschriftung.",
+      metadata: { severity: "important", verification: "verified" }
+    });
+
+  it("injects a deterministic finding for a verified important defect the AI never mentioned", () => {
+    const derived = deriveDeterministicFindings([formEvidence()], new Set());
+    expect(derived).toHaveLength(1);
+    expect(derived[0].kind).toBe("issue");
+    expect(derived[0].severity).toBe("important");
+    expect(derived[0].evidenceIds).toEqual(["ev-form"]);
+  });
+
+  it("does not duplicate a verified defect the AI already correctly reported", () => {
+    const derived = deriveDeterministicFindings(
+      [formEvidence()],
+      new Set(["ev-form"])
+    );
+    expect(derived).toHaveLength(0);
+  });
+
+  it("consolidates the same verified defect across FR and AR into one finding", () => {
+    const fr = formEvidence();
+    const ar = guardianEvidence({
+      id: "ev-form-ar",
+      observationType: "forms",
+      sourceUrl: "https://reelhaus.de/ar/",
+      metadata: { severity: "important", verification: "verified" }
+    });
+    const derived = deriveDeterministicFindings([fr, ar], new Set());
+    expect(derived).toHaveLength(1);
+    expect(derived[0].evidenceIds.slice().sort()).toEqual(
+      ["ev-form", "ev-form-ar"].sort()
+    );
+  });
+
+  it("does not blindly promote every Guardian note (optional or unverified is excluded)", () => {
+    const optional = guardianEvidence({
+      id: "ev-optional",
+      metadata: { severity: "optional", verification: "verified" }
+    });
+    const unverified = guardianEvidence({
+      id: "ev-unverified",
+      metadata: { severity: "critical", verification: "inference" }
+    });
+    const derived = deriveDeterministicFindings([optional, unverified], new Set());
+    expect(derived).toHaveLength(0);
+  });
+});
+
+describe("Problem 6 — strengths never carry a defect severity", () => {
+  it("a persisted strength has severity: null and impact set instead, end to end", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async (_model, inputs) => {
+      const payload = evidencePayloadFromPrompt(inputs);
+      const titleId = payload.find((item) => item.observationType === "page_title")!.id;
+      return {
+        response: JSON.stringify({
+          findings: [
+            {
+              title: "Clear positioning",
+              category: "positioning",
+              severity: "critical",
+              priority: 1,
+              summary: "x",
+              evidenceIds: [titleId],
+              confidence: 0.9,
+              kind: "strength"
+            }
+          ]
+        })
+      };
+    });
+    const { result } = await runReelScanV1ClientZero({
+      ai,
+      auditLedger: ledger,
+      fetcher: fakeGuardianFetcher()
+    });
+    const strength = result.findings.find(
+      (finding) => finding.kind === "strength" && finding.title === "Clear positioning"
+    );
+    expect(strength).toBeDefined();
+    expect(strength!.severity).toBeNull();
+    expect(strength!.impact).toBe("high");
+  });
+
+  it("a strength never contributes to score regardless of its underlying severity", () => {
+    expect(scoreImpactFor("strength", "critical")).toBe(0);
+    expect(scoreImpactFor("strength", "optional")).toBe(0);
+  });
+});
+
+describe("Problem 7 — numeric confidence deliberately maps onto EvidenceConfidence", () => {
+  it("pins the documented bucket thresholds", () => {
+    expect(confidenceBucket(1.0)).toBe("High");
+    expect(confidenceBucket(0.75)).toBe("High");
+    expect(confidenceBucket(0.74)).toBe("Medium");
+    expect(confidenceBucket(0.4)).toBe("Medium");
+    expect(confidenceBucket(0.39)).toBe("Low");
+    expect(confidenceBucket(0)).toBe("Low");
+  });
+});
+
+describe("Problem 8 — finding provenance", () => {
+  it("derives ai vs deterministic from analysisRunId rather than a separate stored column", () => {
+    expect(findingOrigin({ analysisRunId: "run-1" })).toBe("ai");
+    expect(findingOrigin({ analysisRunId: null })).toBe("deterministic");
   });
 });

@@ -2,12 +2,16 @@
 //
 // Pipeline: deterministic Website Guardian findings + a small factual
 // content-evidence pass -> Task #2 EvidenceRecords -> Workers AI reasoning
-// over ONLY that evidence -> schema-validated findings, persisted through
-// the audit ledger's lineage invariants -> a deterministic, explainable
-// score and a Fix-before-Build recommendation.
+// over ONLY that evidence -> schema-validated findings -> a deterministic
+// post-validation calibration pass (downgrade uncertainty, consolidate
+// duplicates, guarantee verified defects aren't silently dropped) ->
+// persisted through the audit ledger's lineage invariants -> a
+// deterministic, explainable score and a Fix-before-Build recommendation.
 //
 // This module never calls the AI model with anything but the evidence it
 // was handed, and never trusts AI output without validating it end to end.
+// It also never trusts the AI's *interpretation* of that evidence blindly:
+// scoring and duplicate-handling are deterministic, not prompt-only.
 import {
   type AiChatMessage,
   type WorkersAiBinding,
@@ -21,7 +25,12 @@ import {
   type FindingRecord
 } from "./audit-ledger";
 import type { EvidenceConfidence } from "./sales-types";
-import { analyzeReelHaus, type AuditReport, type Severity } from "./website-analysis";
+import {
+  analyzeReelHaus,
+  type AuditReport,
+  type EvidenceType,
+  type Severity
+} from "./website-analysis";
 
 // Centralized so the model/version can change later without touching the
 // pipeline that calls it.
@@ -49,7 +58,10 @@ const REELSCAN_SEVERITIES: readonly Severity[] = [
   "important",
   "optional"
 ];
-const REELSCAN_KINDS: readonly FindingKind[] = ["strength", "issue"];
+// AI only ever emits "strength" or "issue" — "note" is a deterministic,
+// post-validation classification (see downgradeUncertainIssues) and is
+// intentionally not part of the schema offered to the model.
+const REELSCAN_AI_KINDS: readonly FindingKind[] = ["strength", "issue"];
 
 // Cloudflare's JSON Schema mode (response_format: { type: "json_schema" }).
 // Best-effort — the provider notes this cannot guarantee compliance, so
@@ -73,7 +85,7 @@ export const REELSCAN_JSON_SCHEMA = {
             minItems: 1
           },
           confidence: { type: "number", minimum: 0, maximum: 1 },
-          kind: { type: "string", enum: [...REELSCAN_KINDS] }
+          kind: { type: "string", enum: [...REELSCAN_AI_KINDS] }
         },
         required: [
           "title",
@@ -110,7 +122,7 @@ const MAX_CONTENT_BYTES = 2_000_000;
 const HERO_EXCERPT_LENGTH = 320;
 const SERVICE_TERMS = ["ReelScan", "ReelFix", "ReelBuild", "ReelCare"] as const;
 const ACTION_LINK_PATTERN =
-  /contact|devis|rendez-vous|réserv|reserv|demande|اتصل|تواصل/i;
+  /contact|devis|rendez-vous|réserv|reserv|demande|audit|اتصل|تواصل/i;
 
 function stripHtml(html: string): string {
   return html
@@ -127,13 +139,66 @@ function firstMatch(html: string, pattern: RegExp): string {
   return stripHtml(html.match(pattern)?.[0] || "");
 }
 
+// -- Action-link evidence (Problem 3) ---------------------------------------
+//
+// The collector previously deduplicated CTA occurrences by destination
+// before recording evidence, so three visible buttons pointing at the same
+// #audit anchor became "1 link detected" — indistinguishable from a page
+// with genuinely one weak, hard-to-find action. Total occurrences and
+// unique destinations are now recorded as separate facts, with a
+// deterministic action type per occurrence, so the AI (and a human) can
+// tell "one clear primary conversion path" from "hard to find any action".
+
+type ActionLinkType =
+  | "email"
+  | "phone"
+  | "whatsapp"
+  | "anchor"
+  | "contact_page"
+  | "other";
+
+interface ActionLinkOccurrence {
+  href: string;
+  text: string;
+  type: ActionLinkType;
+}
+
+function classifyActionLink(href: string): ActionLinkType {
+  if (/^mailto:/i.test(href)) return "email";
+  if (/^tel:/i.test(href)) return "phone";
+  if (/wa\.me|whatsapp\.com/i.test(href)) return "whatsapp";
+  if (href.startsWith("#")) return "anchor";
+  if (ACTION_LINK_PATTERN.test(href)) return "contact_page";
+  return "other";
+}
+
+function extractActionLinkOccurrences(links: string[]): ActionLinkOccurrence[] {
+  return links
+    .filter((tag) => {
+      const hrefMatch = tag.match(/href\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+      const href = hrefMatch?.[1] || hrefMatch?.[2] || "";
+      const text = stripHtml(tag);
+      return (
+        /^mailto:|^tel:|wa\.me|whatsapp\.com/i.test(href) ||
+        ACTION_LINK_PATTERN.test(`${text} ${href}`)
+      );
+    })
+    .map((tag) => {
+      const hrefMatch = tag.match(/href\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+      const href = hrefMatch?.[1] || hrefMatch?.[2] || "";
+      const text = stripHtml(tag);
+      return { href, text, type: classifyActionLink(href) };
+    });
+}
+
 interface ContentSignals {
   pageUrl: string;
   title: string;
   metaDescription: string;
   primaryHeading: string;
   heroExcerpt: string;
-  actionLinks: string[];
+  actionOccurrences: ActionLinkOccurrence[];
+  uniqueActionDestinations: string[];
   serviceTermMentions: Array<{ term: string; excerpt: string | null }>;
 }
 
@@ -155,21 +220,10 @@ function extractContentSignals(pageUrl: string, html: string): ContentSignals {
   const links = [...html.matchAll(/<a\b[^>]*>[\s\S]*?<\/a>/gi)].map(
     (match) => match[0]
   );
-  const actionLinks = links
-    .filter((tag) => {
-      const href = tag.match(/href\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
-      const hrefValue = href?.[1] || href?.[2] || "";
-      const text = stripHtml(tag);
-      return (
-        /^mailto:|^tel:|wa\.me|whatsapp\.com/i.test(hrefValue) ||
-        ACTION_LINK_PATTERN.test(`${text} ${hrefValue}`)
-      );
-    })
-    .map((tag) => {
-      const href = tag.match(/href\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
-      return href?.[1] || href?.[2] || stripHtml(tag);
-    })
-    .filter(Boolean);
+  const actionOccurrences = extractActionLinkOccurrences(links);
+  const uniqueActionDestinations = [
+    ...new Set(actionOccurrences.map((occurrence) => occurrence.href))
+  ].filter(Boolean);
 
   const serviceTermMentions = SERVICE_TERMS.map((term) => {
     const index = bodyText.indexOf(term);
@@ -185,7 +239,8 @@ function extractContentSignals(pageUrl: string, html: string): ContentSignals {
     metaDescription,
     primaryHeading,
     heroExcerpt,
-    actionLinks: [...new Set(actionLinks)],
+    actionOccurrences,
+    uniqueActionDestinations,
     serviceTermMentions
   };
 }
@@ -196,12 +251,16 @@ function contentEvidenceInputs(
   capturedAt: string
 ): Array<Omit<EvidenceRecord, "id">> {
   const collector = "reelscan-v1@content-evidence";
+  // Every content-evidence record is a direct factual detection, not an
+  // inference or a "couldn't check" disclaimer — unlike some Website
+  // Guardian findings (see technicalEvidenceFromGuardianReport).
   const base = {
     scanId,
     sourceType: "html_static",
     sourceUrl: signals.pageUrl,
     capturedAt,
-    collector
+    collector,
+    metadata: { verification: "verified" as EvidenceType }
   };
   const records: Array<Omit<EvidenceRecord, "id">> = [
     {
@@ -235,8 +294,14 @@ function contentEvidenceInputs(
     {
       ...base,
       observationType: "action_link_signals",
-      observation: signals.actionLinks.length
-        ? `${signals.actionLinks.length} link(s) were detected whose href or text matched contact/action patterns (mailto, tel, WhatsApp, or contact/devis/réservation-style wording): ${signals.actionLinks.slice(0, 10).join(", ")}.`
+      observation: signals.actionOccurrences.length
+        ? `${signals.actionOccurrences.length} action-oriented link occurrence(s) were detected on this page (mailto/tel/WhatsApp links, or links/text matching contact/devis/réservation-style wording), resolving to ${signals.uniqueActionDestinations.length} unique destination(s). Occurrences: ${signals.actionOccurrences
+            .slice(0, 10)
+            .map(
+              (occurrence) =>
+                `"${occurrence.text || occurrence.href}" -> ${occurrence.href} (${occurrence.type})`
+            )
+            .join("; ")}. A small number of unique destinations reached by several visible elements is a single clear conversion path, not a low link count.`
         : "No link on this page matched contact or action patterns (searched for mailto:, tel:, WhatsApp links, and contact/devis/réservation-style wording)."
     }
   ];
@@ -299,10 +364,21 @@ export function technicalEvidenceFromGuardianReport(
     collector: "website-analysis@analyzeReelHaus",
     metadata: {
       severity: finding.severity,
-      evidenceType: finding.evidence,
+      // "verified" = the collector actually confirmed this fact.
+      // "inference" = a heuristic signal, OR (as with the always-on
+      // responsive-layout note) a plain disclaimer that something could
+      // not be checked at all. Neither is proof of a defect on its own —
+      // see downgradeUncertainIssues().
+      verification: finding.evidence,
       reportId: report.id
     }
   }));
+}
+
+const GUARDIAN_COLLECTOR = "website-analysis@analyzeReelHaus";
+
+function evidenceVerification(evidence: EvidenceRecord): EvidenceType {
+  return evidence.metadata?.verification === "inference" ? "inference" : "verified";
 }
 
 // -- AI reasoning ---------------------------------------------------------
@@ -329,7 +405,13 @@ export interface ValidatedReelScanFinding {
   kind: FindingKind;
 }
 
-function confidenceBucket(value: number): EvidenceConfidence {
+// Workers AI is asked for a 0.0-1.0 confidence, but every other confidence
+// value in this repository (sales-types.ts EvidenceConfidence, used
+// throughout business-workspace.ts etc.) is a High/Medium/Low tri-level —
+// there is no raw-float concept anywhere else in the app. This bucketing is
+// an intentional, deliberate mapping onto that existing convention, not an
+// accident: exported and boundary-tested so the thresholds are pinned.
+export function confidenceBucket(value: number): EvidenceConfidence {
   if (value >= 0.75) return "High";
   if (value >= 0.4) return "Medium";
   return "Low";
@@ -342,6 +424,10 @@ export function buildReelScanPrompt(
 
 Treat the supplied evidence as the complete factual universe for this analysis. Do not invent missing facts. If something cannot be established from evidence, do not claim it. Do not reference SEO rankings, traffic, revenue, or conversion rates unless that exact fact appears in the evidence.
 
+Each evidence item has a "verification" field. "inference" means the collector could not actually verify this fact (a heuristic guess, or a plain statement that something was not tested) — it is NOT proof of a defect. Do not create an "issue" finding whose only support is inference-only evidence; at most note it as context.
+
+When evidence distinguishes total link occurrences from unique destinations, a small number of unique destinations reached by several visible elements is a strength (one clear conversion path), not a weakness. Only report an action-path issue when the evidence itself shows an actual absence of, or demonstrated difficulty finding, a next action.
+
 Respond with ONLY a JSON object of this exact shape, no prose outside the JSON:
 {"findings": [
   {
@@ -352,18 +438,19 @@ Respond with ONLY a JSON object of this exact shape, no prose outside the JSON:
     "summary": "1-3 sentences, grounded only in the cited evidence",
     "evidenceIds": ["one or more evidence id strings from the supplied evidence — never invent an id"],
     "confidence": number from 0.0 to 1.0,
-    "kind": one of ${JSON.stringify(REELSCAN_KINDS)}
+    "kind": one of ${JSON.stringify(REELSCAN_AI_KINDS)}
   }
 ]}
 
-Include both "issue" findings (supported problems) and "strength" findings (supported positives) when the evidence supports them. Every finding must cite at least one evidenceId that exists in the evidence you were given. Do not fabricate praise or problems.`;
+Include both "issue" findings (supported problems) and "strength" findings (supported positives) when the evidence supports them. Every finding must cite at least one evidenceId that exists in the evidence you were given. Do not fabricate praise or problems. Do not create separate findings for the same underlying signal repeated only because it appears on both the French and Arabic page — the AI's output is deterministically consolidated afterward, but citing all matching evidenceIds in one finding is preferred over duplicating it.`;
 
   const evidencePayload = evidence.map((item) => ({
     id: item.id,
     sourceType: item.sourceType,
     sourceUrl: item.sourceUrl,
     observationType: item.observationType,
-    observation: item.observation
+    observation: item.observation,
+    verification: evidenceVerification(item)
   }));
 
   const user = `Evidence (the complete factual universe for this scan):\n${JSON.stringify(evidencePayload)}\n\nAnalyze findability/identity, trust, action/conversion path, service clarity, and mobile/technical customer-journey friction. Return the JSON object now.`;
@@ -455,7 +542,7 @@ export function parseReelScanAiResponse(
       );
     if (
       typeof item.kind !== "string" ||
-      !REELSCAN_KINDS.includes(item.kind as FindingKind)
+      !REELSCAN_AI_KINDS.includes(item.kind as FindingKind)
     )
       throw new ReelScanValidationError(`${prefix}.kind is invalid`);
 
@@ -475,6 +562,173 @@ export function parseReelScanAiResponse(
   return validated;
 }
 
+// -- Deterministic calibration (Problems 1, 2, 4, 5) -------------------------
+//
+// The AI is instructed not to score uncertainty and not to duplicate across
+// categories/locales, but instructions are not guarantees. Everything below
+// re-derives the correct outcome from evidence and structure, independent
+// of whether the model actually complied.
+
+// Problem 1: evidence whose only content is "not verified / not tested /
+// manual review required / collector cannot determine" must not become a
+// scored defect merely because the AI phrased it as one. A finding is only
+// downgraded when EVERY evidence ID it cites is inference-only — a finding
+// backed by at least one verified fact keeps its "issue" classification.
+export function downgradeUncertainIssues(
+  findings: ValidatedReelScanFinding[],
+  evidenceById: ReadonlyMap<string, EvidenceRecord>
+): ValidatedReelScanFinding[] {
+  return findings.map((finding) => {
+    if (finding.kind !== "issue") return finding;
+    const evidenceItems = finding.evidenceIds
+      .map((id) => evidenceById.get(id))
+      .filter((item): item is EvidenceRecord => Boolean(item));
+    const allUnverified =
+      evidenceItems.length > 0 &&
+      evidenceItems.every((item) => evidenceVerification(item) === "inference");
+    if (!allUnverified) return finding;
+    return {
+      ...finding,
+      kind: "note",
+      summary: `${finding.summary} (Reclassified: based only on unverified/manual-review evidence, not a confirmed defect — see cited evidence for the collector's limitation.)`
+    };
+  });
+}
+
+// Problems 2 & 5: one root problem must not deduct score multiple times
+// merely because it was phrased under several categories, or because the
+// same structural signal exists once per language page. Findings of the
+// same kind whose evidence maps to the exact same set of evidence
+// "observationType"s (locale-independent — e.g. FR and AR responsive
+// evidence both have observationType "responsive") are merged into one,
+// keeping every original evidence ID for lineage.
+const SEVERITY_RANK: Record<Severity, number> = {
+  critical: 3,
+  important: 2,
+  optional: 1
+};
+
+function evidenceTypeSetKey(
+  finding: ValidatedReelScanFinding,
+  evidenceById: ReadonlyMap<string, EvidenceRecord>
+): string {
+  const types = new Set(
+    finding.evidenceIds.map(
+      (id) => evidenceById.get(id)?.observationType || "unknown"
+    )
+  );
+  return [...types].sort().join("+");
+}
+
+function pickRepresentative(
+  group: ValidatedReelScanFinding[]
+): ValidatedReelScanFinding {
+  return [...group].sort(
+    (a, b) =>
+      SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] ||
+      a.priority - b.priority
+  )[0];
+}
+
+export function consolidateFindings(
+  findings: ValidatedReelScanFinding[],
+  evidenceById: ReadonlyMap<string, EvidenceRecord>
+): ValidatedReelScanFinding[] {
+  const groups = new Map<string, ValidatedReelScanFinding[]>();
+  for (const finding of findings) {
+    const key = `${finding.kind}::${evidenceTypeSetKey(finding, evidenceById)}`;
+    const group = groups.get(key);
+    if (group) group.push(finding);
+    else groups.set(key, [finding]);
+  }
+  const consolidated: ValidatedReelScanFinding[] = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      consolidated.push(group[0]);
+      continue;
+    }
+    const representative = pickRepresentative(group);
+    const evidenceIds = [...new Set(group.flatMap((item) => item.evidenceIds))];
+    consolidated.push({
+      ...representative,
+      evidenceIds,
+      summary: `${representative.summary} (Consolidated from ${group.length} equivalent findings across categories/locales; all evidence retained.)`
+    });
+  }
+  return consolidated;
+}
+
+// Problem 4: a verified, important-or-worse Website Guardian defect must
+// end up in the final finding set even if the AI never mentions it. Only
+// evidence the AI's (post-consolidation) issue findings did NOT already
+// cite is eligible, so a correctly-reported AI finding is never duplicated.
+const DETERMINISTIC_INJECTION_SEVERITIES: ReadonlySet<Severity> = new Set([
+  "critical",
+  "important"
+]);
+
+const GUARDIAN_CATEGORY_TO_REELSCAN: Record<string, ReelScanCategory> = {
+  availability: "technical",
+  links: "technical",
+  metadata: "service_clarity",
+  language: "consistency",
+  rtl: "technical",
+  forms: "action_path",
+  responsive: "mobile",
+  accessibility: "technical",
+  seo: "service_clarity"
+};
+
+function mapGuardianCategory(category: string): ReelScanCategory {
+  return GUARDIAN_CATEGORY_TO_REELSCAN[category] || "technical";
+}
+
+function priorityForSeverity(severity: Severity): number {
+  return severity === "critical" ? 1 : severity === "important" ? 2 : 4;
+}
+
+export function deriveDeterministicFindings(
+  evidence: EvidenceRecord[],
+  coveredEvidenceIds: ReadonlySet<string>
+): ValidatedReelScanFinding[] {
+  const evidenceById = new Map(evidence.map((item) => [item.id, item]));
+  const eligible = evidence.filter((item) => {
+    if (item.collector !== GUARDIAN_COLLECTOR) return false;
+    if (coveredEvidenceIds.has(item.id)) return false;
+    if (evidenceVerification(item) !== "verified") return false;
+    const severity = item.metadata?.severity as Severity | undefined;
+    return Boolean(severity && DETERMINISTIC_INJECTION_SEVERITIES.has(severity));
+  });
+  if (!eligible.length) return [];
+
+  const candidates: ValidatedReelScanFinding[] = eligible.map((item) => {
+    const severity = item.metadata?.severity as Severity;
+    return {
+      title: item.observation.split(":")[0].trim() || item.observationType,
+      category: mapGuardianCategory(item.observationType),
+      severity,
+      priority: priorityForSeverity(severity),
+      summary: item.observation,
+      evidenceIds: [item.id],
+      confidence: "High",
+      kind: "issue"
+    };
+  });
+
+  // Reuse the exact same locale-consolidation as AI findings: an identical
+  // FR + AR structural defect is one finding referencing both evidence IDs.
+  return consolidateFindings(candidates, evidenceById);
+}
+
+// Problem 8: minimal provenance. A finding produced without an AI analysis
+// run behind it is deterministic by construction — this is derived, not a
+// new stored column, so it can't drift from the actual persisted lineage.
+export function findingOrigin(
+  finding: Pick<FindingRecord, "analysisRunId">
+): "deterministic" | "ai" {
+  return finding.analysisRunId ? "ai" : "deterministic";
+}
+
 // -- Deterministic scoring --------------------------------------------------
 
 export const REELSCAN_SEVERITY_DEDUCTIONS: Record<Severity, number> = {
@@ -483,8 +737,23 @@ export const REELSCAN_SEVERITY_DEDUCTIONS: Record<Severity, number> = {
   optional: 3
 };
 
+// Only "issue" findings ever deduct. "strength" and "note" (Problem 1)
+// always contribute 0 — strengths must never reduce score, and uncertainty
+// is not a scored defect.
 export function scoreImpactFor(kind: FindingKind, severity: Severity): number {
-  return kind === "strength" ? 0 : -REELSCAN_SEVERITY_DEDUCTIONS[severity];
+  return kind === "issue" ? -REELSCAN_SEVERITY_DEDUCTIONS[severity] : 0;
+}
+
+// Problem 6: severity is a defect scale. Persisting {kind:"strength",
+// severity:"critical"} reads as a critical *problem* to anything consuming
+// the raw record. Strengths get `impact` instead, `severity: null` — the
+// smallest change that removes the ambiguity without a schema rewrite (the
+// AI-facing JSON Schema is untouched; only the persisted/exposed shape for
+// strengths differs, translated right here).
+function severityToImpact(severity: Severity): "high" | "medium" | "low" {
+  if (severity === "critical") return "high";
+  if (severity === "important") return "medium";
+  return "low";
 }
 
 export interface ReelScanScore {
@@ -524,6 +793,9 @@ export interface ReelScanRecommendation {
   reasons: string[];
 }
 
+// Operates on whatever `findings` it's given — the orchestrator passes the
+// final, post-downgrade/post-consolidation/post-injection set, so this
+// function needed no changes to satisfy "recommendation after dedup".
 export function recommendReelScanAction(
   findings: FindingRecord[]
 ): ReelScanRecommendation {
@@ -593,6 +865,29 @@ export interface ReelScanV1Deps {
   fetcher: typeof fetch;
 }
 
+function persistCandidate(
+  auditLedger: AuditLedgerService,
+  scanId: string,
+  analysisRunId: string | null,
+  candidate: ValidatedReelScanFinding
+): FindingRecord {
+  const isStrength = candidate.kind === "strength";
+  return auditLedger.recordFinding({
+    scanId,
+    analysisRunId,
+    kind: candidate.kind,
+    title: candidate.title,
+    category: candidate.category,
+    severity: isStrength ? null : candidate.severity,
+    impact: isStrength ? severityToImpact(candidate.severity) : undefined,
+    priority: candidate.priority,
+    summary: candidate.summary,
+    evidenceIds: candidate.evidenceIds,
+    confidence: candidate.confidence,
+    scoreImpact: scoreImpactFor(candidate.kind, candidate.severity)
+  });
+}
+
 export async function runReelScanV1ClientZero(
   deps: ReelScanV1Deps
 ): Promise<{ result: ReelScanV1Result; report: AuditReport }> {
@@ -607,6 +902,7 @@ export async function runReelScanV1ClientZero(
     deps.auditLedger.recordEvidence(input)
   );
   const evidenceIds = evidence.map((item) => item.id);
+  const evidenceById = new Map(evidence.map((item) => [item.id, item]));
 
   const run = deps.auditLedger.startAiAnalysisRun({
     scanId,
@@ -632,25 +928,31 @@ export async function runReelScanV1ClientZero(
       },
       REELSCAN_AI_TIMEOUT_MS
     );
-    const validated = parseReelScanAiResponse(
+    const rawValidated = parseReelScanAiResponse(
       response.response,
       new Set(evidenceIds)
     );
-    findings = validated.map((finding) =>
-      deps.auditLedger.recordFinding({
-        scanId,
-        analysisRunId: run.id,
-        kind: finding.kind,
-        title: finding.title,
-        category: finding.category,
-        severity: finding.severity,
-        priority: finding.priority,
-        summary: finding.summary,
-        evidenceIds: finding.evidenceIds,
-        confidence: finding.confidence,
-        scoreImpact: scoreImpactFor(finding.kind, finding.severity)
-      })
+
+    const downgraded = downgradeUncertainIssues(rawValidated, evidenceById);
+    const consolidatedAi = consolidateFindings(downgraded, evidenceById);
+    const coveredEvidenceIds = new Set(
+      consolidatedAi
+        .filter((finding) => finding.kind === "issue")
+        .flatMap((finding) => finding.evidenceIds)
     );
+    const deterministic = deriveDeterministicFindings(
+      evidence,
+      coveredEvidenceIds
+    );
+
+    findings = [
+      ...consolidatedAi.map((candidate) =>
+        persistCandidate(deps.auditLedger, scanId, run.id, candidate)
+      ),
+      ...deterministic.map((candidate) =>
+        persistCandidate(deps.auditLedger, scanId, null, candidate)
+      )
+    ];
     deps.auditLedger.completeAiAnalysisRun(run.id, { status: "completed" });
   } catch (error) {
     deps.auditLedger.completeAiAnalysisRun(run.id, {
