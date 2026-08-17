@@ -1,4 +1,6 @@
-import { leadDedupeKey, normalizeEmail, normalizeUrl } from "./sales-policy";
+import { leadDedupeKey, normalizeUrl } from "./sales-policy";
+import { safeFetchPublicUrl } from "./safe-fetch";
+import { validatePublicScanUrl } from "./url-safety";
 import type {
   DiscoveryCandidate,
   DiscoveryCandidateInput,
@@ -119,11 +121,6 @@ function publicUrl(value?: string): string {
   return normalized;
 }
 
-function normalizedPhone(value?: string): string {
-  const digits = (value || "").replace(/\D/g, "");
-  return digits.length >= 8 ? digits : "";
-}
-
 function normalizedName(value: string): string {
   return value
     .normalize("NFKD")
@@ -133,17 +130,14 @@ function normalizedName(value: string): string {
     .trim();
 }
 
-function validCoordinate(
-  value: number | undefined,
-  limit: number
-): number | undefined {
-  return typeof value === "number" &&
-    Number.isFinite(value) &&
-    Math.abs(value) <= limit
-    ? Number(value.toFixed(6))
-    : undefined;
-}
-
+// Task #6B (privacy-minimized Discovery v1): Discovery must not intentionally
+// collect or persist contact/person data, exact coordinates, or social/
+// booking arrays — even when a public source provides them. This is the one
+// choke point every extraction path (OSM, Wikidata, JSON-LD, the manual
+// queue) normalizes through before storage, so stripping these fields here
+// is sufficient to keep them out of every Discovery write. Existing DB
+// columns for these fields stay nullable for schema compatibility; new
+// Discovery writes simply leave them empty. Historical rows are untouched.
 export function normalizeDiscoveryCandidate(
   input: DiscoveryCandidateInput
 ): DiscoveryCandidateInput {
@@ -153,21 +147,18 @@ export function normalizeDiscoveryCandidate(
     city: input.city?.trim() || "",
     country: (input.country || "MA").trim().toUpperCase(),
     websiteUrl: publicUrl(input.websiteUrl) || undefined,
-    mapsUrl: publicUrl(input.mapsUrl) || undefined,
-    publicEmail: normalizeEmail(input.publicEmail) || undefined,
-    phone: input.phone?.trim() || undefined,
-    whatsapp: input.whatsapp?.trim() || undefined,
-    socialLinks: unique(input.socialLinks || [])
-      .map(publicUrl)
-      .filter(Boolean),
-    bookingLinks: unique(input.bookingLinks || [])
-      .map(publicUrl)
-      .filter(Boolean),
+    // Intentionally dropped for privacy-minimized v1, regardless of input:
+    mapsUrl: undefined,
+    publicEmail: undefined,
+    phone: undefined,
+    whatsapp: undefined,
+    socialLinks: [],
+    bookingLinks: [],
+    latitude: undefined,
+    longitude: undefined,
     languagesDetected: unique(input.languagesDetected || []).map((language) =>
       language.toLocaleLowerCase()
     ),
-    latitude: validCoordinate(input.latitude, 90),
-    longitude: validCoordinate(input.longitude, 180),
     sourceUrls: unique(input.sourceUrls || [])
       .map(publicUrl)
       .filter(Boolean),
@@ -183,32 +174,32 @@ export function normalizeDiscoveryCandidate(
   };
 }
 
+// Preferred business-level identity for dedupe: website hostname when
+// available, otherwise business name + city. No longer depends on contact
+// data (phone/email) or precise location (coordinates/maps link) — those
+// fields are no longer collected by Discovery v1 (see
+// normalizeDiscoveryCandidate above).
 export function discoveryIdentityKeys(
   input: DiscoveryCandidateInput
 ): string[] {
   const normalized = normalizeDiscoveryCandidate(input);
-  const keys: string[] = [];
   if (normalized.websiteUrl)
-    keys.push(
+    return [
       `website:${new URL(normalized.websiteUrl).hostname.replace(/^www\./, "")}`
-    );
-  const phone = normalizedPhone(normalized.phone);
-  if (phone) keys.push(`phone:${phone}`);
-  if (normalized.latitude !== undefined && normalized.longitude !== undefined)
-    keys.push(
-      `coordinates:${normalized.latitude.toFixed(5)},${normalized.longitude.toFixed(5)}`
-    );
-  if (normalized.mapsUrl) keys.push(`maps:${normalized.mapsUrl}`);
-  keys.push(
+    ];
+  return [
     `name-city:${normalizedName(normalized.businessName)}|${normalizedName(normalized.city)}`
-  );
-  return [...new Set(keys.filter((key) => !key.endsWith(":")))];
+  ];
 }
 
 export function discoveryDedupeKey(input: DiscoveryCandidateInput): string {
   return discoveryIdentityKeys(input)[0] || "invalid:unknown";
 }
 
+// Checked against already-promoted `leads` rows only (historical data —
+// Discovery-to-Lead promotion itself is disabled, see sales-agent.ts). No
+// longer passes contact data through: leadDedupeKey() already prefers
+// website, then falls back to name+city once email is absent.
 export function discoveryLeadDedupeKey(input: DiscoveryCandidateInput): string {
   const normalized = normalizeDiscoveryCandidate(input);
   return leadDedupeKey({
@@ -217,10 +208,6 @@ export function discoveryLeadDedupeKey(input: DiscoveryCandidateInput): string {
     city: normalized.city,
     country: "MA",
     websiteUrl: normalized.websiteUrl,
-    mapsUrl: normalized.mapsUrl,
-    publicEmail: normalized.publicEmail,
-    phone: normalized.phone,
-    whatsapp: normalized.whatsapp,
     sourceUrls: normalized.sourceUrls,
     language: normalized.language,
     pilot: normalized.pilot
@@ -248,29 +235,18 @@ export function mergeDiscoveryCandidates(
   existing: DiscoveryCandidateInput,
   incoming: DiscoveryCandidateInput
 ): DiscoveryCandidateInput {
+  // Both sides are already stripped of contact/social/coordinate data by
+  // normalizeDiscoveryCandidate — nothing left here to merge for those
+  // fields (Task #6B).
   const current = normalizeDiscoveryCandidate(existing);
   const next = normalizeDiscoveryCandidate(incoming);
   return {
     ...current,
     websiteUrl: current.websiteUrl || next.websiteUrl,
-    mapsUrl: current.mapsUrl || next.mapsUrl,
-    publicEmail: current.publicEmail || next.publicEmail,
-    phone: current.phone || next.phone,
-    whatsapp: current.whatsapp || next.whatsapp,
-    socialLinks: unique([
-      ...(current.socialLinks || []),
-      ...(next.socialLinks || [])
-    ]),
-    bookingLinks: unique([
-      ...(current.bookingLinks || []),
-      ...(next.bookingLinks || [])
-    ]),
     languagesDetected: unique([
       ...(current.languagesDetected || []),
       ...(next.languagesDetected || [])
     ]),
-    latitude: current.latitude ?? next.latitude,
-    longitude: current.longitude ?? next.longitude,
     discoverySource: current.discoverySource || next.discoverySource,
     sourceUrls: unique([...current.sourceUrls, ...next.sourceUrls]),
     pilot: Boolean(current.pilot || next.pilot),
@@ -294,34 +270,19 @@ export function evaluateDiscoveryCandidate(
   if (!normalized.sourceUrls.length)
     reasons.push("No valid public source URL is available.");
 
-  const directContactSignals = [
-    normalized.publicEmail,
-    normalized.phone,
-    normalized.whatsapp
-  ].filter(Boolean).length;
-  const linkedSignals =
-    (normalized.socialLinks?.length || 0) +
-    (normalized.bookingLinks?.length || 0);
-  const identitySignals = [
-    normalized.websiteUrl,
-    normalized.mapsUrl,
-    normalized.latitude !== undefined && normalized.longitude !== undefined
-      ? "coordinates"
-      : "",
-    directContactSignals ? "contact" : "",
-    linkedSignals ? "public-link" : ""
-  ].filter(Boolean).length;
-  if (!normalized.websiteUrl && identitySignals < 2)
-    reasons.push(
-      "A candidate without a website needs at least two independent public identity or contact signals."
-    );
-
+  // Task #6B: acceptance and confidence must no longer depend on contact
+  // data (email/phone/WhatsApp), precise coordinates, or social/booking
+  // links — none of that is collected any more (normalizeDiscoveryCandidate
+  // always clears it). A business without a website is still acceptable on
+  // name + city alone, matching the preferred business-level identity model
+  // (see discoveryIdentityKeys); a website plus multiple independent public
+  // sources is what raises confidence.
   const accepted = reasons.length === 0;
   const confidence: EvidenceConfidence = !accepted
     ? "Low"
-    : normalized.sourceUrls.length >= 2 && identitySignals >= 2
+    : normalized.websiteUrl && normalized.sourceUrls.length >= 2
       ? "High"
-      : identitySignals >= 1
+      : normalized.websiteUrl || normalized.sourceUrls.length >= 2
         ? "Medium"
         : "Low";
   return { accepted, confidence, reasons, normalized };
@@ -348,12 +309,10 @@ export function calculateDiscoveryPriority(
     baseScore += points;
     reasons.push(`${reason}: +${points}`);
   };
+  // Task #6B: priority scoring must not depend on contact data or social
+  // presence — neither is collected any more (normalizeDiscoveryCandidate).
   if (candidate.websiteUrl) add(10, "Public website can be evaluated");
   else add(15, "No standalone website is recorded");
-  if (candidate.socialLinks?.length)
-    add(6, "Public social presence is recorded");
-  if (candidate.publicEmail || candidate.phone || candidate.whatsapp)
-    add(4, "Public business contact is recorded");
   const verifiedCodes = new Set(
     observations
       .filter((observation) => observation.verified)
@@ -531,6 +490,13 @@ export async function researchOpenStreetMapHospitality(
           "user-agent": "ReelHaus-Discovery/1.0 public-hospitality-research"
         },
         body: `data=${encodeURIComponent(osmHospitalityQuery(location, day))}`,
+        // Task #6B: this is one of two fixed, hardcoded HTTPS endpoints
+        // (never candidate-controlled) — "manual" is the safest small fix
+        // appropriate here: refuse to blindly follow a redirect rather than
+        // building full per-hop revalidation for a URL that never varies.
+        // A 3xx response is not `.ok`, so it already falls into the
+        // failure branch below.
+        redirect: "manual",
         signal: AbortSignal.timeout(endpoint === OPENSTREETMAP_OVERPASS_ENDPOINTS[0] ? 20_000 : 10_000)
       });
       if (!response.ok) {
@@ -554,15 +520,11 @@ export async function researchOpenStreetMapHospitality(
       const businessName = stringValue(tags.name);
       if (!category || !businessName) return [];
       const sourceUrl = `https://www.openstreetmap.org/${element.type}/${element.id}`;
+      // Task #6B: only the business's own website is a public-review
+      // signal Discovery keeps. contact:email/phone/whatsapp and social/
+      // booking links are deliberately never read into the candidate,
+      // even when OSM publishes them — not just stripped later.
       const websiteUrl = osmPublicUrl(tags, "contact:website", "website", "url");
-      const socialLinks = unique([
-        osmPublicUrl(tags, "contact:instagram", "instagram"),
-        osmPublicUrl(tags, "contact:facebook", "facebook"),
-        osmPublicUrl(tags, "contact:tiktok", "tiktok")
-      ]);
-      const bookingLinks = unique([
-        osmPublicUrl(tags, "reservation:website", "booking", "contact:booking")
-      ]);
       const languagesDetected = [
         tags["name:fr"] ? "fr" : "",
         tags["name:ar"] ? "ar" : ""
@@ -574,24 +536,7 @@ export async function researchOpenStreetMapHospitality(
           city: stringValue(tags["addr:city"]) || location.city,
           country: "MA",
           websiteUrl: websiteUrl || undefined,
-          mapsUrl: sourceUrl,
-          publicEmail:
-            stringValue(tags["contact:email"]) ||
-            stringValue(tags.email) ||
-            undefined,
-          phone:
-            stringValue(tags["contact:phone"]) ||
-            stringValue(tags.phone) ||
-            undefined,
-          whatsapp:
-            stringValue(tags["contact:whatsapp"]) ||
-            stringValue(tags.whatsapp) ||
-            undefined,
-          socialLinks,
-          bookingLinks,
           languagesDetected,
-          latitude: element.lat ?? element.center?.lat,
-          longitude: element.lon ?? element.center?.lon,
           discoverySource: sourceUrl,
           sourceUrls: [sourceUrl],
           language:
@@ -649,6 +594,10 @@ export async function researchWikidataHospitality(
         "user-agent": "ReelHaus-Discovery/1.0 (https://reelhaus.de)",
         "api-user-agent": "ReelHaus-Discovery/1.0 (https://reelhaus.de)"
       },
+      // Task #6B: fixed HTTPS endpoint, never candidate-controlled — refuse
+      // to blindly follow a redirect (see the matching comment above in
+      // researchOpenStreetMapHospitality).
+      redirect: "manual",
       signal: AbortSignal.timeout(15_000)
     });
     if (!response.ok)
@@ -738,18 +687,6 @@ function stringArray(value: unknown): string[] {
       : [];
 }
 
-function bookingTargets(value: unknown): string[] {
-  if (Array.isArray(value)) return value.flatMap(bookingTargets);
-  if (typeof value === "string") return [value];
-  if (!value || typeof value !== "object") return [];
-  const object = value as Record<string, unknown>;
-  return [
-    stringValue(object.url),
-    stringValue(object.urlTemplate),
-    ...bookingTargets(object.target)
-  ].filter(Boolean);
-}
-
 function countryIsMorocco(value: unknown): boolean {
   const country =
     typeof value === "object" && value
@@ -784,19 +721,10 @@ export function extractPublicDirectoryCandidates(
           : {};
       if (!category || !name || !countryIsMorocco(address.addressCountry))
         continue;
-      const socialLinks = stringArray(object.sameAs)
-        .map(publicUrl)
-        .filter(Boolean);
-      const mapsUrl = socialLinks.find((url) =>
-        /google\.[^/]+\/maps|maps\.app\.goo\.gl/i.test(url)
-      );
-      const bookingLinks = bookingTargets(object.potentialAction)
-        .map(publicUrl)
-        .filter(Boolean);
-      const geo =
-        object.geo && typeof object.geo === "object"
-          ? (object.geo as Record<string, unknown>)
-          : {};
+      // Task #6B: only the business's own website is kept as a public-
+      // review signal. email/telephone, sameAs (social) links, booking
+      // links, and geo coordinates are deliberately never read into the
+      // candidate, even when the source's JSON-LD publishes them.
       const languagesDetected = unique([
         ...stringArray(object.inLanguage),
         ...stringArray(object.availableLanguage)
@@ -807,14 +735,7 @@ export function extractPublicDirectoryCandidates(
         city: stringValue(address.addressLocality),
         country: "MA",
         websiteUrl: publicUrl(stringValue(object.url)) || undefined,
-        mapsUrl,
-        publicEmail: stringValue(object.email) || undefined,
-        phone: stringValue(object.telephone) || undefined,
-        socialLinks,
-        bookingLinks,
         languagesDetected,
-        latitude: Number(stringValue(geo.latitude)) || undefined,
-        longitude: Number(stringValue(geo.longitude)) || undefined,
         sourceUrls: [sourceUrl],
         discoverySource: sourceUrl,
         language: "fr",
@@ -828,83 +749,81 @@ export function extractPublicDirectoryCandidates(
   return candidates;
 }
 
+// Task #6B: candidate-controlled/configured source URLs are variable, so
+// they go through the existing hardened, redirect-safe fetcher
+// (safe-fetch.ts) instead of a raw fetch() — every hop, including the
+// robots.txt lookup, is re-validated by url-safety.ts, not just the initial
+// URL as typed.
 export async function researchPublicSource(
   sourceUrl: string,
   fetcher: typeof fetch = fetch
 ): Promise<PublicSourceResult> {
-  const normalizedSource = publicUrl(sourceUrl);
-  if (!normalizedSource)
-    return { sourceUrl, candidates: [], skippedReason: "Invalid public URL" };
-  const url = new URL(normalizedSource);
-  const headers = {
-    accept: "text/html,application/xhtml+xml",
-    "user-agent": "ReelHaus-Discovery/1.0 public-hospitality-research"
-  };
-  try {
-    const robotsResponse = await fetcher(new URL("/robots.txt", url), {
-      headers,
-      signal: AbortSignal.timeout(8_000)
-    });
-    if (robotsResponse.status === 401 || robotsResponse.status === 403)
-      return {
-        sourceUrl: normalizedSource,
-        candidates: [],
-        skippedReason: "robots.txt is not publicly accessible"
-      };
-    if (
-      robotsResponse.ok &&
-      !robotsAllowsDiscovery(await robotsResponse.text(), url.pathname)
-    )
-      return {
-        sourceUrl: normalizedSource,
-        candidates: [],
-        skippedReason: "robots.txt disallows this source"
-      };
-    const response = await fetcher(normalizedSource, {
-      headers,
-      redirect: "follow",
-      signal: AbortSignal.timeout(12_000)
-    });
-    if (!response.ok)
-      return {
-        sourceUrl: normalizedSource,
-        candidates: [],
-        skippedReason: `Source returned HTTP ${response.status}`
-      };
-    if (
-      !(response.headers.get("content-type") || "")
-        .toLowerCase()
-        .includes("text/html")
-    )
-      return {
-        sourceUrl: normalizedSource,
-        candidates: [],
-        skippedReason: "Source is not HTML"
-      };
-    const declaredSize = Number(response.headers.get("content-length") || 0);
-    if (declaredSize > MAX_SOURCE_HTML_BYTES)
-      return {
-        sourceUrl: normalizedSource,
-        candidates: [],
-        skippedReason: "Source exceeds the size limit"
-      };
-    const html = await response.text();
-    if (new TextEncoder().encode(html).byteLength > MAX_SOURCE_HTML_BYTES)
-      return {
-        sourceUrl: normalizedSource,
-        candidates: [],
-        skippedReason: "Source exceeds the size limit"
-      };
+  const validation = validatePublicScanUrl(sourceUrl);
+  if (!validation.ok)
     return {
-      sourceUrl: normalizedSource,
-      candidates: extractPublicDirectoryCandidates(html, normalizedSource)
+      sourceUrl,
+      candidates: [],
+      skippedReason: `Invalid public URL: ${validation.reason}`
     };
-  } catch (error) {
+  const normalizedSource = validation.url;
+  const url = new URL(normalizedSource);
+  const fetchOptions = {
+    totalTimeoutMs: 12_000,
+    userAgent: "ReelHaus-Discovery/1.0 public-hospitality-research"
+  } as const;
+
+  const robotsResult = await safeFetchPublicUrl(
+    fetcher,
+    new URL("/robots.txt", url).toString(),
+    {
+      ...fetchOptions,
+      totalTimeoutMs: 8_000,
+      // robots.txt is conventionally text/plain, not HTML — the default
+      // allowlist (html only) would wrongly reject a standards-compliant
+      // robots.txt response.
+      allowedContentTypes: ["text/plain", "text/html", "application/xhtml+xml"]
+    }
+  );
+  if (!robotsResult.ok && robotsResult.reason === "http_401")
     return {
       sourceUrl: normalizedSource,
       candidates: [],
-      skippedReason:
-        error instanceof Error ? error.message : "Public source fetch failed"
+      skippedReason: "robots.txt is not publicly accessible"
     };
-  }
+  if (!robotsResult.ok && robotsResult.reason === "http_403")
+    return {
+      sourceUrl: normalizedSource,
+      candidates: [],
+      skippedReason: "robots.txt is not publicly accessible"
+    };
+  // Any other robots.txt outcome (missing, timed out, wrong content type,
+  // etc.) is treated as "no robots.txt to enforce" — matching the prior
+  // behavior, which only ever blocked on a fetched, parseable robots.txt.
+  if (
+    robotsResult.ok &&
+    !robotsAllowsDiscovery(robotsResult.html, url.pathname)
+  )
+    return {
+      sourceUrl: normalizedSource,
+      candidates: [],
+      skippedReason: "robots.txt disallows this source"
+    };
+
+  const pageResult = await safeFetchPublicUrl(fetcher, normalizedSource, {
+    ...fetchOptions,
+    maxContentBytes: MAX_SOURCE_HTML_BYTES
+  });
+  if (!pageResult.ok)
+    return {
+      sourceUrl: normalizedSource,
+      candidates: [],
+      skippedReason: `Source fetch failed: ${pageResult.reason}`
+    };
+  return {
+    sourceUrl: pageResult.finalUrl,
+    candidates: extractPublicDirectoryCandidates(
+      pageResult.html,
+      pageResult.finalUrl
+    )
+  };
 }

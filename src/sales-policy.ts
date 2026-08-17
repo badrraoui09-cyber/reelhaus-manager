@@ -54,6 +54,17 @@ export function leadDedupeKey(input: LeadInput): string {
     .toLowerCase()}`;
 }
 
+// Task #6B: a hard, code-level gate for any Lead a discovery_candidates row
+// still points at (discovery_candidates.lead_id) — independent of
+// OUTREACH_ENABLED, so an accidental future flip of that env var back to
+// "true" cannot re-enable outreach for a Discovery-origin lead. The caller
+// (sales-agent.ts) is responsible for looking up whether the lead is
+// Discovery-linked; this function is the single source of truth for what
+// that lookup result means.
+export function discoveryOutreachBlocked(isDiscoveryLinkedLead: boolean): boolean {
+  return isDiscoveryLinkedLead;
+}
+
 export function canTransition(from: LeadStatus, to: LeadStatus): boolean {
   return ALLOWED_TRANSITIONS[from].includes(to);
 }

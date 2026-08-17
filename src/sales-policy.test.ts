@@ -3,6 +3,7 @@ import {
   approvalIsUsable,
   canContact,
   canTransition,
+  discoveryOutreachBlocked,
   followUpAllowed,
   leadDedupeKey,
   outreachIsEnabled
@@ -78,5 +79,10 @@ describe("lead policy", () => {
     );
     expect(approvalIsUsable({ ...current, approvedVersion: 1 })).toBe(false);
     expect(approvalIsUsable({ ...current, contactAllowed: false })).toBe(false);
+  });
+
+  it("blocks outreach for a Discovery-linked lead independent of any other flag (Task #6B)", () => {
+    expect(discoveryOutreachBlocked(true)).toBe(true);
+    expect(discoveryOutreachBlocked(false)).toBe(false);
   });
 });

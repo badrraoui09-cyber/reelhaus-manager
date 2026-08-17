@@ -55,6 +55,7 @@ import {
   approvalIsUsable,
   canContact,
   canTransition,
+  discoveryOutreachBlocked,
   followUpAllowed,
   leadDedupeKey,
   normalizeEmail,
@@ -229,6 +230,14 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
         id TEXT PRIMARY KEY, input_json TEXT NOT NULL, queued_at TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'queued', error TEXT
       );
+      -- Task #6B REMAINING BLOCKER (retention): discovery_candidates, the
+      -- companies/leads rows a candidate can be linked to, and their
+      -- audits/qualifications/drafts have no retention or deletion rule —
+      -- unlike public_intake_requests (see public-intake-retention.ts's
+      -- 90-day cleanup). No duration is chosen here; Task #6A's audit
+      -- explicitly said not to invent one. Do not add a cleanup pass for
+      -- this table without an explicit, separately approved retention
+      -- duration decision first.
       CREATE TABLE IF NOT EXISTS discovery_candidates (
         id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE,
         business_name TEXT NOT NULL, category TEXT NOT NULL, city TEXT NOT NULL,
@@ -1327,161 +1336,25 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
     };
   }
 
-  private async sendCandidateToReelScan(id: string, request: Request) {
+  // Task #6B: Discovery-to-Lead promotion is disabled pending the privacy/
+  // legal gate. For privacy-minimized v1, a Discovery candidate must not
+  // become an ordinary CRM Lead — this unconditionally blocks the handoff
+  // that used to call discoverLead() (INSERT INTO companies + leads).
+  // discoverLead() itself is intentionally left in place, unreachable from
+  // this route, rather than deleted — see the module-level guidance not to
+  // remove Discovery code in this task.
+  private async sendCandidateToReelScan(id: string, _request: Request) {
     const candidate = this.candidate(id);
     if (!candidate)
       return json({ error: "Discovery candidate not found" }, 404);
-    if (["rejected", "ignored"].includes(candidate.status))
-      return json(
-        { error: "Rejected or ignored candidates cannot be scanned" },
-        409
-      );
-    const body = (await request.json().catch(() => ({}))) as {
-      force?: boolean;
-    };
-    if (candidate.leadId && !body.force)
-      return json(
-        {
-          error:
-            "Candidate was already scanned; an explicit manual rescan is required"
-        },
-        409
-      );
-
-    const now = new Date().toISOString();
-    const previousStatus = candidate.status;
-    this.ctx.storage.sql.exec(
-      "UPDATE discovery_candidates SET status = 'analyzing', updated_at = ? WHERE id = ?",
-      now,
-      id
+    return json(
+      {
+        error:
+          "Discovery-to-Lead promotion is disabled pending the privacy/legal gate (Task #6B)",
+        code: "DISCOVERY_PROMOTION_DISABLED"
+      },
+      409
     );
-    try {
-      const result = candidate.leadId
-        ? { created: false, id: candidate.leadId }
-        : await this.discoverLead({
-            businessName: candidate.businessName,
-            category: candidate.category,
-            city: candidate.city,
-            country: "MA",
-            websiteUrl: candidate.websiteUrl,
-            mapsUrl: candidate.mapsUrl,
-            publicEmail: candidate.publicEmail,
-            phone: candidate.phone,
-            whatsapp: candidate.whatsapp,
-            sourceUrls: candidate.sourceUrls,
-            language: candidate.language,
-            pilot: candidate.pilot
-          });
-      if (!result.created && !candidate.leadId) {
-        const duplicateAt = new Date().toISOString();
-        this.ctx.storage.sql.exec(
-          `UPDATE discovery_candidates SET status = 'ignored', lead_id = ?,
-           rejection_reason = ?, ignored_at = ?, updated_at = ? WHERE id = ?`,
-          result.id,
-          "Merged with an existing canonical CRM business.",
-          duplicateAt,
-          duplicateAt,
-          id
-        );
-        this.recordActivity(
-          result.id,
-          "system:autonomous-discovery-agent",
-          "candidate.duplicate_skipped",
-          {
-            candidateId: id,
-            canonicalLeadId: result.id,
-            incomingBusinessName: candidate.businessName,
-            detectedDuring: "reelscan_handoff",
-            qualificationStarted: false,
-            emailActionTaken: false
-          }
-        );
-        return json({
-          candidate: this.candidate(id),
-          leadId: result.id,
-          duplicateSkipped: true,
-          reelScanCreated: false,
-          qualificationRecommendationCreated: false,
-          crmEntryCreated: false,
-          emailActionTaken: false
-        });
-      }
-      const auditResponse = await this.auditLead(result.id);
-      if (!auditResponse.ok)
-        throw new Error(`ReelScan returned HTTP ${auditResponse.status}`);
-      const audit = (await auditResponse.json()) as ReelScanLeadAudit;
-      const qualificationResponse = this.qualifyLead(result.id);
-      if (!qualificationResponse.ok)
-        throw new Error(
-          `Qualification recommendation returned HTTP ${qualificationResponse.status}`
-        );
-      const completedAt = new Date().toISOString();
-      const languageEvidence = audit.observations
-        .filter((observation) => observation.signal === "languages")
-        .flatMap(
-          (observation) =>
-            (observation.evidence || "").match(
-              /\b[a-z]{2,3}(?:-[A-Z]{2})?\b/g
-            ) || []
-        );
-      const languagesDetected = [
-        ...new Set([
-          ...(candidate.languagesDetected || []),
-          ...languageEvidence.map((language) => language.toLocaleLowerCase())
-        ])
-      ];
-      const learningAdjustment = this.discoveryLearningFor(candidate);
-      const priority = calculateDiscoveryPriority(
-        candidate,
-        audit.observations,
-        learningAdjustment
-      );
-      this.ctx.storage.sql.exec(
-        `UPDATE discovery_candidates SET status = 'scanned',
-         lead_id = ?, languages_json = ?, priority_score = ?,
-         priority_reasons_json = ?, learning_adjustment = ?,
-         scanned_at = ?, updated_at = ? WHERE id = ?`,
-        result.id,
-        JSON.stringify(languagesDetected),
-        priority.score,
-        JSON.stringify(priority.reasons),
-        priority.learningAdjustment,
-        completedAt,
-        completedAt,
-        id
-      );
-      this.recordActivity(
-        result.id,
-        request.headers.get("x-reelhaus-approver") || "authenticated-user",
-        "candidate.scanned",
-        {
-          candidateId: id,
-          manualRescan: Boolean(body.force),
-          qualificationRecommendationCreated: true,
-          crmEntryCreated: false,
-          emailActionTaken: false
-        }
-      );
-      return json(
-        {
-          candidate: this.candidate(id),
-          leadId: result.id,
-          reelScanCreated: true,
-          qualificationRecommendationCreated: true,
-          crmEntryCreated: false,
-          emailActionTaken: false
-        },
-        201
-      );
-    } catch (error) {
-      this.ctx.storage.sql.exec(
-        "UPDATE discovery_candidates SET status = ?, updated_at = ? WHERE id = ?",
-        previousStatus,
-        new Date().toISOString(),
-        id
-      );
-      throw error;
-    }
   }
 
   private async recordCandidateDecision(id: string, request: Request) {
@@ -2145,6 +2018,23 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
     return row ? this.mapDraft(row) : null;
   }
 
+  // Task #6B structural no-outreach protection: true when a
+  // discovery_candidates row still references this lead (historical
+  // Discovery-origin leads may already exist from before Discovery-to-Lead
+  // promotion was disabled). See discoveryOutreachBlocked() for how this
+  // is used — deliberately a direct DB check, not the OUTREACH_ENABLED env
+  // var, so it can't be bypassed by an accidental config change.
+  private isDiscoveryLinkedLead(leadId: string): boolean {
+    return Boolean(
+      this.ctx.storage.sql
+        .exec<{ id: string }>(
+          "SELECT id FROM discovery_candidates WHERE lead_id = ? LIMIT 1",
+          leadId
+        )
+        .toArray()[0]
+    );
+  }
+
   private peerDraftOpenings(draft: EmailDraft): PeerDraftOpening[] {
     return this.ctx.storage.sql
       .exec<{
@@ -2367,6 +2257,15 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   private async createDraft(id: string, request: Request) {
     const lead = this.lead(id);
     if (!lead) return json({ error: "Lead not found" }, 404);
+    if (discoveryOutreachBlocked(this.isDiscoveryLinkedLead(id)))
+      return json(
+        {
+          error:
+            "Outreach is disabled for Discovery-linked leads pending the privacy/legal gate (Task #6B)",
+          code: "DISCOVERY_OUTREACH_BLOCKED"
+        },
+        409
+      );
     if (!canContact(lead))
       return json({ error: "Lead must not be contacted" }, 409);
     if (!["qualified", "draft_ready", "contacted"].includes(lead.status))
@@ -2648,6 +2547,19 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   }
 
   private async sendApprovedDraft(id: string) {
+    // Task #6B structural no-outreach protection: checked first, and
+    // independent of OUTREACH_ENABLED below — this must still block sending
+    // even if that env var is ever accidentally set back to "true".
+    const draftForGate = this.draft(id);
+    if (draftForGate && this.isDiscoveryLinkedLead(draftForGate.leadId))
+      return json(
+        {
+          error:
+            "Outreach is disabled for Discovery-linked leads pending the privacy/legal gate (Task #6B)",
+          code: "DISCOVERY_OUTREACH_BLOCKED"
+        },
+        409
+      );
     if (!outreachIsEnabled(this.env.OUTREACH_ENABLED))
       return json(
         { error: "OUTREACH_ENABLED is false; sending is disabled" },
