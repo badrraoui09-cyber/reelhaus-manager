@@ -7,6 +7,9 @@
   "browser": {
     "binding": "BROWSER"
   },
+  "ai": {
+    "binding": "AI"
+  },
   "vars": {
     "ALLOW_LOCAL_BEARER_AUTH": "false",
     "EMAIL_MODE": "mock",

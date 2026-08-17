@@ -3,6 +3,7 @@ const API_ROUTES: ReadonlyArray<{
   pathname: RegExp;
 }> = [
   { method: "GET", pathname: /^\/api\/auth\/diagnostic$/ },
+  { method: "GET", pathname: /^\/api\/ai\/health$/ },
   { method: "POST", pathname: /^\/api\/scan$/ },
   { method: "GET", pathname: /^\/api\/reports$/ },
   { method: "GET", pathname: /^\/api\/reports\/[^/]+$/ },

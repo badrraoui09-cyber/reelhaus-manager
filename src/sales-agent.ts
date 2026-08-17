@@ -1,4 +1,5 @@
 import { Agent } from "agents";
+import { checkAiHealth } from "./ai-service";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
 import {
   BusinessAssistantAgent,
@@ -355,6 +356,8 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
     try {
       if (request.method === "POST" && url.pathname === "/scan")
         return await this.runGuardianScan();
+      if (request.method === "GET" && url.pathname === "/ai/health")
+        return await this.aiHealthCheck();
       if (request.method === "GET" && url.pathname === "/reports")
         return this.listReports();
       if (request.method === "GET" && url.pathname.startsWith("/reports/"))
@@ -461,6 +464,11 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       });
       return json({ error: message(error) }, 500);
     }
+  }
+
+  private async aiHealthCheck() {
+    const health = await checkAiHealth(this.env.AI);
+    return json(health, health.ok ? 200 : 503);
   }
 
   private usage(day = new Date().toISOString().slice(0, 10)) {
