@@ -11,10 +11,9 @@
 // turnstile.ts, rate-limit.ts) are the actual access controls; this module
 // only decides which headers a real browser request gets back.
 
-const ALLOWED_PUBLIC_ORIGINS = new Set([
-  "https://reelhaus.de",
-  "https://www.reelhaus.de"
-]);
+import { PUBLIC_CORS_ORIGINS } from "./public-intake-config";
+
+const ALLOWED_PUBLIC_ORIGINS = new Set<string>(PUBLIC_CORS_ORIGINS);
 
 export interface CorsDecision {
   allowed: boolean;

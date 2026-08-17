@@ -2,6 +2,9 @@ import { Agent } from "agents";
 import { checkAiHealth } from "./ai-service";
 import { AuditLedgerService, SqlAuditLedgerStore } from "./audit-ledger";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
+import { handlePublicReelScanRequest } from "./public-intake-route";
+import { listInboundRequestsForManager } from "./public-intake-service";
+import { SqlPublicIntakeStore } from "./public-intake-store";
 import { runReelScanV1ClientZero } from "./reelscan";
 import {
   BusinessAssistantAgent,
@@ -146,12 +149,14 @@ function validateLeadInput(input: LeadInput): string | null {
 
 export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   private readonly auditLedger: AuditLedgerService;
+  private readonly publicIntakeStore: SqlPublicIntakeStore;
 
   constructor(ctx: DurableObjectState, env: SalesEnv) {
     super(ctx, env);
     this.auditLedger = new AuditLedgerService(
       new SqlAuditLedgerStore(this.ctx.storage.sql)
     );
+    this.publicIntakeStore = new SqlPublicIntakeStore(this.ctx.storage.sql);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS reports (
         id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
@@ -371,6 +376,15 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       if (request.method === "GET" && url.pathname === "/ai/health")
         return await this.aiHealthCheck();
       if (
+        (request.method === "POST" || request.method === "OPTIONS") &&
+        url.pathname === "/public-intake/submit"
+      )
+        return await this.handlePublicIntakeSubmit(request);
+      if (request.method === "GET" && url.pathname === "/inbound-requests")
+        return json(
+          listInboundRequestsForManager(this.publicIntakeStore, this.auditLedger)
+        );
+      if (
         request.method === "GET" &&
         /^\/audit\/scans\/[^/]+$/.test(url.pathname)
       )
@@ -488,6 +502,23 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   private async aiHealthCheck() {
     const health = await checkAiHealth(this.env.AI);
     return json(health, health.ok ? 200 : 503);
+  }
+
+  // Reached only via server.ts's fixed, hardcoded internal forward for the
+  // one Access-bypassing public route — see routePublicReelScan() and
+  // isPublicApiRoute(). All actual validation/Turnstile/CORS/rate-limit/
+  // ReelScan logic lives in public-intake-route.ts, fully unit tested;
+  // this is deliberately a one-line call, nothing DO-specific to test here.
+  private async handlePublicIntakeSubmit(request: Request): Promise<Response> {
+    return handlePublicReelScanRequest(request, {
+      store: this.publicIntakeStore,
+      auditLedger: this.auditLedger,
+      ai: this.env.AI,
+      fetcher: fetch,
+      turnstileSecretKey: this.env.TURNSTILE_SECRET_KEY,
+      rateLimitPepper: this.env.PUBLIC_RATE_LIMIT_PEPPER,
+      callerIp: request.headers.get("cf-connecting-ip")
+    });
   }
 
   private usage(day = new Date().toISOString().slice(0, 10)) {

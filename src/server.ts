@@ -4,7 +4,7 @@ import {
   validateCloudflareAccess,
   type AccessValidationResult
 } from "./access-auth";
-import { isApiPath, isKnownApiRoute } from "./server-routing";
+import { isApiPath, isKnownApiRoute, isPublicApiRoute } from "./server-routing";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -90,6 +90,27 @@ async function routeApi(request: Request, env: WorkerEnv): Promise<Response> {
   );
 }
 
+// The ONE deliberate exception to Cloudflare Access: no auth check, no
+// x-reelhaus-approver identity — see isPublicApiRoute() for the exact
+// method/path match this is gated on. The internal path forwarded to the
+// Durable Object is a fixed literal, never derived from the incoming
+// request's own path/body, so this can never become a proxy into
+// arbitrary internal Manager routes.
+async function routePublicReelScan(
+  request: Request,
+  env: WorkerEnv
+): Promise<Response> {
+  const id = env.REELHAUS_MANAGER.idFromName("reelhaus-manager");
+  return env.REELHAUS_MANAGER.get(id).fetch(
+    new Request("https://internal/public-intake/submit", {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+      redirect: "manual"
+    })
+  );
+}
+
 async function runScheduledDiscovery(env: WorkerEnv): Promise<void> {
   const id = env.REELHAUS_MANAGER.idFromName("reelhaus-manager");
   const response = await env.REELHAUS_MANAGER.get(id).fetch(
@@ -111,6 +132,8 @@ export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
     if (isApiPath(url.pathname)) {
+      if (isPublicApiRoute(request.method, url.pathname))
+        return routePublicReelScan(request, env);
       if (!isKnownApiRoute(request.method, url.pathname))
         return json({ error: "Not found" }, 404);
       if (

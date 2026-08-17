@@ -6,6 +6,7 @@ import {
   REELSCAN_JSON_SCHEMA,
   REELSCAN_MODEL,
   REELSCAN_SEVERITY_DEDUCTIONS,
+  ReelScanTargetError,
   ReelScanValidationError,
   applySeverityFloor,
   buildReelScanPrompt,
@@ -19,6 +20,7 @@ import {
   parseReelScanAiResponse,
   recommendReelScanAction,
   runReelScanV1ClientZero,
+  runReelScanV1Target,
   scoreImpactFor,
   technicalEvidenceFromGuardianReport,
   type ValidatedReelScanFinding
@@ -1308,5 +1310,178 @@ describe("prompt injection containment", () => {
     });
     const [floored] = applySeverityFloor([hijacked], evidenceById);
     expect(floored.severity).toBe("important");
+  });
+});
+
+// -- Task #5A — generalized ReelScan for arbitrary (customer) targets ------
+
+describe("runReelScanV1Target", () => {
+  function targetFetcher(html: string): typeof fetch {
+    return (async () =>
+      new Response(html, {
+        status: 200,
+        headers: { "content-type": "text/html" }
+      })) as unknown as typeof fetch;
+  }
+
+  const CUSTOMER_HTML = `<!DOCTYPE html><html lang="fr"><head>
+    <title>Le Petit Café — Restaurant à Casablanca</title>
+    <meta name="description" content="Un restaurant familial servant une cuisine marocaine authentique au centre de Casablanca.">
+    </head><body>
+    <h1>Le Petit Café</h1>
+    <p>Bienvenue chez nous. Réservez une table ou contactez-nous pour un événement privé.</p>
+    <a href="mailto:contact@lepetitcafe.example">Contact</a>
+  </body></html>`;
+
+  it("scans a safe generic target end to end and reaches needs_review", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async (_model, inputs) => {
+      const payload = evidencePayloadFromPrompt(inputs);
+      const titleId = payload.find((item) => item.observationType === "page_title")!.id;
+      return {
+        response: JSON.stringify({
+          findings: [
+            {
+              title: "Clear restaurant identity",
+              category: "positioning",
+              severity: "optional",
+              priority: 4,
+              summary: "The title and heading clearly identify the business.",
+              evidenceIds: [titleId],
+              confidence: 0.8,
+              kind: "strength"
+            }
+          ]
+        })
+      };
+    });
+
+    const result = await runReelScanV1Target({
+      targetUrl: "https://lepetitcafe.example/",
+      ai,
+      auditLedger: ledger,
+      fetcher: targetFetcher(CUSTOMER_HTML)
+    });
+
+    expect(result.analysisRun.status).toBe("completed");
+    expect(result.targetUrls).toEqual(["https://lepetitcafe.example/"]);
+    expect(result.reviewStatus).toBe("needs_review");
+    expect(result.evidence.length).toBeGreaterThan(0);
+    // No Website Guardian equivalent runs for a generic single-page target,
+    // so nothing here can carry a deterministic severity floor from Guardian
+    // metadata — confirming that absence is a no-op, not an error.
+    expect(result.findings.every((f) => findingOrigin(f) === "ai")).toBe(true);
+
+    const trail = ledger.getScanAuditTrail(result.scanId);
+    expect(trail.findings).toHaveLength(1);
+  });
+
+  it("rejects an unsafe target before any fetch or AI call", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    let fetchCalled = false;
+    let aiCalled = false;
+    const fetcher = (async () => {
+      fetchCalled = true;
+      return new Response("unreachable", { status: 200 });
+    }) as unknown as typeof fetch;
+    const ai = fakeAi(async () => {
+      aiCalled = true;
+      return { response: JSON.stringify({ findings: [] }) };
+    });
+
+    await expect(
+      runReelScanV1Target({
+        targetUrl: "https://169.254.169.254/latest/meta-data/",
+        ai,
+        auditLedger: ledger,
+        fetcher
+      })
+    ).rejects.toThrow(ReelScanTargetError);
+    expect(fetchCalled).toBe(false);
+    expect(aiCalled).toBe(false);
+  });
+
+  it("surfaces a fetch failure as ReelScanTargetError, not a fabricated empty scan", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const fetcher = (async () =>
+      new Response("nope", { status: 503 })) as unknown as typeof fetch;
+
+    await expect(
+      runReelScanV1Target({
+        targetUrl: "https://example.com/",
+        ai: fakeAi(async () => ({ response: JSON.stringify({ findings: [] }) })),
+        auditLedger: ledger,
+        fetcher
+      })
+    ).rejects.toThrow(ReelScanTargetError);
+  });
+
+  it("revalidates and rejects a redirect into a private address for a customer target", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "https://example.com/")
+        return new Response(null, {
+          status: 302,
+          headers: { location: "http://127.0.0.1/admin" }
+        });
+      return new Response("unreachable", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await expect(
+      runReelScanV1Target({
+        targetUrl: "https://example.com/",
+        ai: fakeAi(async () => ({ response: JSON.stringify({ findings: [] }) })),
+        auditLedger: ledger,
+        fetcher
+      })
+    ).rejects.toThrow(ReelScanTargetError);
+  });
+
+  it("still fails closed to analysis_failed (not a fabricated success) when AI itself fails for a customer target", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async () => ({ response: "not valid json" }));
+
+    const result = await runReelScanV1Target({
+      targetUrl: "https://lepetitcafe.example/",
+      ai,
+      auditLedger: ledger,
+      fetcher: targetFetcher(CUSTOMER_HTML)
+    });
+
+    expect(result.analysisRun.status).toBe("failed");
+    expect(result.reviewStatus).toBe("analysis_failed");
+    expect(result.findings).toHaveLength(0);
+    expect(result.score).toBeNull();
+    expect(result.recommendation).toBeNull();
+  });
+
+  it("still rejects a fake evidence ID for a customer target (lineage protections preserved)", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const ai = fakeAi(async () => ({
+      response: JSON.stringify({
+        findings: [
+          {
+            title: "x",
+            category: "positioning",
+            severity: "optional",
+            priority: 4,
+            summary: "x",
+            evidenceIds: ["invented-id"],
+            confidence: 0.5,
+            kind: "strength"
+          }
+        ]
+      })
+    }));
+
+    const result = await runReelScanV1Target({
+      targetUrl: "https://lepetitcafe.example/",
+      ai,
+      auditLedger: ledger,
+      fetcher: targetFetcher(CUSTOMER_HTML)
+    });
+    expect(result.analysisRun.status).toBe("failed");
+    expect(result.reviewStatus).toBe("analysis_failed");
   });
 });

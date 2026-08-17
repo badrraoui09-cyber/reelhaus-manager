@@ -45,7 +45,19 @@ const API_ROUTES: ReadonlyArray<{
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/approve$/ },
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/reject$/ },
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/send$/ },
-  { method: "POST", pathname: /^\/api\/assistant$/ }
+  { method: "POST", pathname: /^\/api\/assistant$/ },
+  { method: "GET", pathname: /^\/api\/inbound-requests$/ }
+];
+
+// The exact one route/method pair allowed to bypass Cloudflare Access — a
+// separate list from API_ROUTES on purpose, so the public exception can
+// never accidentally expand by editing the private route table. Kept as an
+// exact string match (not a broader regex) so /api/public/foo,
+// /api/public/reelscan/extra, and /api/public/reelscan/admin all correctly
+// stay private.
+const PUBLIC_API_ROUTES: ReadonlyArray<{ method: string; pathname: string }> = [
+  { method: "POST", pathname: "/api/public/reelscan" },
+  { method: "OPTIONS", pathname: "/api/public/reelscan" }
 ];
 
 export function isApiPath(pathname: string): boolean {
@@ -55,5 +67,11 @@ export function isApiPath(pathname: string): boolean {
 export function isKnownApiRoute(method: string, pathname: string): boolean {
   return API_ROUTES.some(
     (route) => route.method === method && route.pathname.test(pathname)
+  );
+}
+
+export function isPublicApiRoute(method: string, pathname: string): boolean {
+  return PUBLIC_API_ROUTES.some(
+    (route) => route.method === method && route.pathname === pathname
   );
 }

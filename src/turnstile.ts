@@ -10,6 +10,22 @@
 export interface TurnstileVerifyResult {
   success: boolean;
   errorCodes: string[];
+  hostname?: string;
+  action?: string;
+}
+
+export interface TurnstileVerifyOptions {
+  /** CF-Connecting-IP of the caller, passed through to siteverify for its own risk scoring. */
+  remoteIp?: string;
+  timeoutMs?: number;
+  /**
+   * Extra, non-authoritative checks: siteverify's `success` remains the
+   * only thing that actually gates the request. A hostname/action mismatch
+   * on an otherwise-successful verification still fails closed here, but
+   * neither field is ever trusted in isolation of `success === true`.
+   */
+  expectedHostnames?: readonly string[];
+  expectedAction?: string;
 }
 
 const TURNSTILE_VERIFY_URL =
@@ -19,6 +35,8 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 interface TurnstileApiResponse {
   success?: boolean;
   ["error-codes"]?: string[];
+  hostname?: string;
+  action?: string;
 }
 
 /**
@@ -32,18 +50,18 @@ export async function verifyTurnstileToken(
   fetcher: typeof fetch,
   secretKey: string | undefined,
   token: string | undefined,
-  remoteIp?: string,
-  timeoutMs = DEFAULT_TIMEOUT_MS
+  options: TurnstileVerifyOptions = {}
 ): Promise<TurnstileVerifyResult> {
   if (!secretKey) return { success: false, errorCodes: ["missing-secret-key"] };
   if (!token || !token.trim())
     return { success: false, errorCodes: ["missing-input-response"] };
 
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const body = new URLSearchParams({ secret: secretKey, response: token });
-    if (remoteIp) body.set("remoteip", remoteIp);
+    if (options.remoteIp) body.set("remoteip", options.remoteIp);
     const response = await fetcher(TURNSTILE_VERIFY_URL, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -53,9 +71,39 @@ export async function verifyTurnstileToken(
     if (!response.ok)
       return { success: false, errorCodes: [`http_${response.status}`] };
     const payload = (await response.json()) as TurnstileApiResponse;
+
+    if (payload.success !== true)
+      return {
+        success: false,
+        errorCodes: payload["error-codes"] || [],
+        hostname: payload.hostname,
+        action: payload.action
+      };
+
+    if (
+      options.expectedHostnames?.length &&
+      (!payload.hostname || !options.expectedHostnames.includes(payload.hostname))
+    )
+      return {
+        success: false,
+        errorCodes: ["hostname-mismatch"],
+        hostname: payload.hostname,
+        action: payload.action
+      };
+
+    if (options.expectedAction && payload.action !== options.expectedAction)
+      return {
+        success: false,
+        errorCodes: ["action-mismatch"],
+        hostname: payload.hostname,
+        action: payload.action
+      };
+
     return {
-      success: payload.success === true,
-      errorCodes: payload["error-codes"] || []
+      success: true,
+      errorCodes: [],
+      hostname: payload.hostname,
+      action: payload.action
     };
   } catch (error) {
     return {

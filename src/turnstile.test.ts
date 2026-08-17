@@ -80,13 +80,9 @@ describe("verifyTurnstileToken", () => {
         });
       }) as unknown as typeof fetch;
 
-      const resultPromise = verifyTurnstileToken(
-        fetcher,
-        "secret",
-        "token-123",
-        undefined,
-        2_000
-      );
+      const resultPromise = verifyTurnstileToken(fetcher, "secret", "token-123", {
+        timeoutMs: 2_000
+      });
       await vi.advanceTimersByTimeAsync(2_000);
       const result = await resultPromise;
       expect(result.success).toBe(false);
@@ -107,5 +103,79 @@ describe("verifyTurnstileToken", () => {
     }) as unknown as typeof fetch;
     const result = await verifyTurnstileToken(fetcher, "secret", "token-123");
     expect(result.success).toBe(true);
+  });
+
+  it("passes remoteip through when supplied", async () => {
+    const fetcher = (async (_url: string, init?: RequestInit) => {
+      const body = init?.body as URLSearchParams;
+      expect(body.get("remoteip")).toBe("203.0.113.5");
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await verifyTurnstileToken(fetcher, "secret", "token-123", {
+      remoteIp: "203.0.113.5"
+    });
+  });
+
+  it("accepts a matching hostname and action when both are checked", async () => {
+    const fetcher = fakeFetcher(
+      () =>
+        new Response(
+          JSON.stringify({
+            success: true,
+            hostname: "reelhaus.de",
+            action: "reelscan_intake"
+          }),
+          { status: 200 }
+        )
+    );
+    const result = await verifyTurnstileToken(fetcher, "secret", "token-123", {
+      expectedHostnames: ["reelhaus.de", "www.reelhaus.de"],
+      expectedAction: "reelscan_intake"
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("fails closed on a hostname mismatch even when success is true", async () => {
+    const fetcher = fakeFetcher(
+      () =>
+        new Response(
+          JSON.stringify({ success: true, hostname: "evil.example.com" }),
+          { status: 200 }
+        )
+    );
+    const result = await verifyTurnstileToken(fetcher, "secret", "token-123", {
+      expectedHostnames: ["reelhaus.de", "www.reelhaus.de"]
+    });
+    expect(result.success).toBe(false);
+    expect(result.errorCodes).toContain("hostname-mismatch");
+  });
+
+  it("fails closed on an action mismatch even when success is true", async () => {
+    const fetcher = fakeFetcher(
+      () =>
+        new Response(
+          JSON.stringify({ success: true, action: "some_other_form" }),
+          { status: 200 }
+        )
+    );
+    const result = await verifyTurnstileToken(fetcher, "secret", "token-123", {
+      expectedAction: "reelscan_intake"
+    });
+    expect(result.success).toBe(false);
+    expect(result.errorCodes).toContain("action-mismatch");
+  });
+
+  it("never trusts hostname/action alone — success:false with a matching hostname still fails", async () => {
+    const fetcher = fakeFetcher(
+      () =>
+        new Response(
+          JSON.stringify({ success: false, hostname: "reelhaus.de" }),
+          { status: 200 }
+        )
+    );
+    const result = await verifyTurnstileToken(fetcher, "secret", "token-123", {
+      expectedHostnames: ["reelhaus.de"]
+    });
+    expect(result.success).toBe(false);
   });
 });

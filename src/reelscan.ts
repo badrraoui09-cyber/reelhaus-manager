@@ -24,7 +24,9 @@ import {
   type FindingKind,
   type FindingRecord
 } from "./audit-ledger";
+import { safeFetchPublicUrl } from "./safe-fetch";
 import type { EvidenceConfidence } from "./sales-types";
+import { validatePublicScanUrl } from "./url-safety";
 import {
   analyzeReelHaus,
   type AuditReport,
@@ -935,23 +937,31 @@ function persistCandidate(
   });
 }
 
-export async function runReelScanV1ClientZero(
-  deps: ReelScanV1Deps
-): Promise<{ result: ReelScanV1Result; report: AuditReport }> {
-  const report = await analyzeReelHaus(deps.fetcher);
-  const scanId = report.id;
+interface ReelScanV1CoreDeps {
+  scanId: string;
+  targetUrls: string[];
+  evidenceInputs: Array<Omit<EvidenceRecord, "id">>;
+  ai: WorkersAiBinding | undefined;
+  auditLedger: AuditLedgerService;
+}
 
-  const evidenceInputs = [
-    ...technicalEvidenceFromGuardianReport(report),
-    ...(await collectClientZeroContentEvidence(deps.fetcher, scanId))
-  ];
+// Shared by both entry points below: record evidence, run + validate AI
+// reasoning, calibrate deterministically, persist, score, recommend. Every
+// Task #3D/#3E/#4 guarantee (uncertainty downgrade, consolidation, severity
+// floor, evidence-ID lineage, untrusted-evidence prompt framing) lives here
+// exactly once, so Client #0 and any future customer target behave
+// identically at this layer — only evidence *collection* differs above it.
+async function runReelScanV1Core(
+  deps: ReelScanV1CoreDeps
+): Promise<ReelScanV1Result> {
+  const { scanId, targetUrls, evidenceInputs, ai, auditLedger } = deps;
   const evidence = evidenceInputs.map((input) =>
-    deps.auditLedger.recordEvidence(input)
+    auditLedger.recordEvidence(input)
   );
   const evidenceIds = evidence.map((item) => item.id);
   const evidenceById = new Map(evidence.map((item) => [item.id, item]));
 
-  const run = deps.auditLedger.startAiAnalysisRun({
+  const run = auditLedger.startAiAnalysisRun({
     scanId,
     provider: "cloudflare-workers-ai",
     model: REELSCAN_MODEL,
@@ -962,7 +972,7 @@ export async function runReelScanV1ClientZero(
 
   let findings: FindingRecord[] = [];
   try {
-    const service = new WorkersAiService(deps.ai, REELSCAN_MODEL);
+    const service = new WorkersAiService(ai, REELSCAN_MODEL);
     const response = await service.runStructuredPrompt(
       buildReelScanPrompt(evidence),
       {
@@ -997,44 +1007,115 @@ export async function runReelScanV1ClientZero(
 
     findings = [
       ...consolidatedAi.map((candidate) =>
-        persistCandidate(deps.auditLedger, scanId, run.id, candidate)
+        persistCandidate(auditLedger, scanId, run.id, candidate)
       ),
       ...deterministic.map((candidate) =>
-        persistCandidate(deps.auditLedger, scanId, null, candidate)
+        persistCandidate(auditLedger, scanId, null, candidate)
       )
     ];
-    deps.auditLedger.completeAiAnalysisRun(run.id, { status: "completed" });
+    auditLedger.completeAiAnalysisRun(run.id, { status: "completed" });
   } catch (error) {
-    deps.auditLedger.completeAiAnalysisRun(run.id, {
+    auditLedger.completeAiAnalysisRun(run.id, {
       status: "failed",
       error: error instanceof Error ? error.message : "Unknown error"
     });
     return {
-      report,
-      result: {
-        scanId,
-        targetUrls: [...report.targets],
-        evidence,
-        analysisRun: deps.auditLedger.getScanAuditTrail(scanId).analysisRuns.at(-1)!,
-        findings: [],
-        score: null,
-        recommendation: null,
-        reviewStatus: "analysis_failed"
-      }
+      scanId,
+      targetUrls,
+      evidence,
+      analysisRun: auditLedger.getScanAuditTrail(scanId).analysisRuns.at(-1)!,
+      findings: [],
+      score: null,
+      recommendation: null,
+      reviewStatus: "analysis_failed"
     };
   }
 
   return {
-    report,
-    result: {
-      scanId,
-      targetUrls: [...report.targets],
-      evidence,
-      analysisRun: deps.auditLedger.getScanAuditTrail(scanId).analysisRuns.at(-1)!,
-      findings,
-      score: calculateReelScanScore(findings),
-      recommendation: recommendReelScanAction(findings),
-      reviewStatus: "needs_review"
-    }
+    scanId,
+    targetUrls,
+    evidence,
+    analysisRun: auditLedger.getScanAuditTrail(scanId).analysisRuns.at(-1)!,
+    findings,
+    score: calculateReelScanScore(findings),
+    recommendation: recommendReelScanAction(findings),
+    reviewStatus: "needs_review"
   };
+}
+
+/** Thin wrapper preserving exact existing Client #0 behavior. */
+export async function runReelScanV1ClientZero(
+  deps: ReelScanV1Deps
+): Promise<{ result: ReelScanV1Result; report: AuditReport }> {
+  const report = await analyzeReelHaus(deps.fetcher);
+  const scanId = report.id;
+  const evidenceInputs = [
+    ...technicalEvidenceFromGuardianReport(report),
+    ...(await collectClientZeroContentEvidence(deps.fetcher, scanId))
+  ];
+  const result = await runReelScanV1Core({
+    scanId,
+    targetUrls: [...report.targets],
+    evidenceInputs,
+    ai: deps.ai,
+    auditLedger: deps.auditLedger
+  });
+  return { result, report };
+}
+
+export interface ReelScanV1TargetDeps {
+  targetUrl: string;
+  ai: WorkersAiBinding | undefined;
+  auditLedger: AuditLedgerService;
+  fetcher: typeof fetch;
+}
+
+/**
+ * Thrown before any evidence/analysis-run exists yet (the target itself is
+ * unsafe, or fetching it failed) — distinct from a normal analysis_failed
+ * result, which always has a real audit trail behind it. Callers (the
+ * future inbound-request service) are expected to map this to their own
+ * generic public error code, never surface `.reason` to the public caller.
+ */
+export class ReelScanTargetError extends Error {
+  constructor(public readonly reason: string) {
+    super(`ReelScan target could not be scanned: ${reason}`);
+  }
+}
+
+/**
+ * Generalized single-URL ReelScan for a future public/customer target.
+ * Unlike Client #0 (a trusted, hardcoded first-party URL), a submitted
+ * target is untrusted input: it is SSRF-validated, then fetched through
+ * safe-fetch.ts (manual redirect handling, every hop re-validated, a
+ * content-type allow-list, and a streamed byte cap) — never a raw fetch().
+ * There is no Website Guardian equivalent for an arbitrary single-locale
+ * customer site (that collector's checks — required FR/AR hreflang pairing,
+ * RTL correctness — are reelhaus.de-specific), so evidence here is the same
+ * factual content-evidence extraction Client #0 also uses, scoped to the
+ * one validated page. Everything downstream (AI reasoning, validation,
+ * calibration, scoring, recommendation) is identical via runReelScanV1Core.
+ */
+export async function runReelScanV1Target(
+  deps: ReelScanV1TargetDeps
+): Promise<ReelScanV1Result> {
+  const validated = validatePublicScanUrl(deps.targetUrl);
+  if (!validated.ok)
+    throw new ReelScanTargetError(`unsafe_url:${validated.reason}`);
+
+  const fetchResult = await safeFetchPublicUrl(deps.fetcher, validated.url);
+  if (!fetchResult.ok) throw new ReelScanTargetError(fetchResult.reason);
+
+  const scanId = crypto.randomUUID();
+  const capturedAt = new Date().toISOString();
+  const signals = extractContentSignals(fetchResult.finalUrl, fetchResult.html);
+  const evidenceInputs = contentEvidenceInputs(scanId, signals, capturedAt);
+
+  return runReelScanV1Core({
+    scanId,
+    targetUrls: [fetchResult.finalUrl],
+    evidenceInputs,
+    ai: deps.ai,
+    auditLedger: deps.auditLedger
+  });
 }
