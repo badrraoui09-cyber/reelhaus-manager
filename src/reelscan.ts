@@ -253,10 +253,24 @@ function extractContentSignals(pageUrl: string, html: string): ContentSignals {
   };
 }
 
+// Phase 2.5 calibration: whether ReelHaus's own service-term mentions
+// (ReelScan/ReelFix/ReelBuild/ReelCare) get recorded as evidence at all.
+// Checking whether ReelHaus's OWN site mentions ReelHaus's OWN service
+// names is a legitimate Client #0 self-check; checking whether an
+// arbitrary customer's website mentions ReelHaus's product names is not a
+// real website-quality signal and must never affect a customer target's
+// evidence, findings, score, or recommendation. Defaults to false so any
+// future caller that forgets to pass this explicitly gets the safe
+// (customer-target) behavior.
+interface ContentEvidenceOptions {
+  includeServiceTermEvidence?: boolean;
+}
+
 function contentEvidenceInputs(
   scanId: string,
   signals: ContentSignals,
-  capturedAt: string
+  capturedAt: string,
+  options: ContentEvidenceOptions = {}
 ): Array<Omit<EvidenceRecord, "id">> {
   const collector = "reelscan-v1@content-evidence";
   // Every content-evidence record is a direct factual detection, not an
@@ -313,14 +327,15 @@ function contentEvidenceInputs(
         : "No link on this page matched contact or action patterns (searched for mailto:, tel:, WhatsApp links, and contact/devis/réservation-style wording)."
     }
   ];
-  for (const mention of signals.serviceTermMentions)
-    records.push({
-      ...base,
-      observationType: `service_term:${mention.term}`,
-      observation: mention.excerpt
-        ? `The term "${mention.term}" appears on this page. Surrounding text: "${mention.excerpt}".`
-        : `The term "${mention.term}" was not found in this page's visible text.`
-    });
+  if (options.includeServiceTermEvidence)
+    for (const mention of signals.serviceTermMentions)
+      records.push({
+        ...base,
+        observationType: `service_term:${mention.term}`,
+        observation: mention.excerpt
+          ? `The term "${mention.term}" appears on this page. Surrounding text: "${mention.excerpt}".`
+          : `The term "${mention.term}" was not found in this page's visible text.`
+      });
   return records;
 }
 
@@ -345,7 +360,13 @@ export async function collectClientZeroContentEvidence(
       const html = await response.text();
       const capturedAt = new Date().toISOString();
       const signals = extractContentSignals(page.url, html);
-      results.push(...contentEvidenceInputs(scanId, signals, capturedAt));
+      // Client #0 only: checking whether ReelHaus's own pages mention
+      // ReelHaus's own service names is a legitimate self-check.
+      results.push(
+        ...contentEvidenceInputs(scanId, signals, capturedAt, {
+          includeServiceTermEvidence: true
+        })
+      );
     } catch {
       // A failed content-signal fetch is not evidence; the Website Guardian
       // pass already records availability failures as technical findings.
@@ -876,22 +897,72 @@ const FOUNDATIONAL_CATEGORIES: ReadonlySet<ReelScanCategory> = new Set([
   "service_clarity"
 ]);
 
+// Task #2.18 — P0 reliability fix. Real pilot validation (Riad Kniza,
+// Tasks #2.9/#2.12/#2.15) showed the SAME unmodified site swinging between
+// ReelFix and ReelBuild across separate runs, purely because the AI's own
+// severity/category wording judgment for a content-quality finding
+// (positioning/service_clarity) varied between runs. Unlike a structural
+// defect (missing alt text, a broken form), "does this hero text clearly
+// explain the offer" has no deterministic fact behind it, so the AI's
+// severity rating for that kind of finding is a subjective call that can
+// legitimately differ between two otherwise-identical runs of the same
+// model — and it must not, by itself, be able to escalate a functional
+// site to ReelBuild. A critical foundational finding is now only eligible
+// to trigger ReelBuild if it cites at least one VERIFIED, deterministic
+// piece of evidence — the exact same standard applySeverityFloor() already
+// holds AI-reported severity to elsewhere in this file. This doesn't
+// remove AI judgment: the AI still decides severity/category, and an
+// unbacked critical foundational finding still counts as a serious
+// ReelFix-worthy issue below (see `repairable`) — it just can no longer,
+// alone, justify ReelBuild.
+function isFoundationallyEvidenceBacked(
+  finding: FindingRecord,
+  evidenceById: ReadonlyMap<string, EvidenceRecord>
+): boolean {
+  return finding.evidenceIds.some((id) => {
+    const item = evidenceById.get(id);
+    return (
+      item !== undefined &&
+      DETERMINISTIC_EVIDENCE_COLLECTORS.has(item.collector) &&
+      evidenceVerification(item) === "verified"
+    );
+  });
+}
+
 export interface ReelScanRecommendation {
   action: ReelScanRecommendedAction;
   reasons: string[];
 }
 
-// Operates on whatever `findings` it's given — the orchestrator passes the
-// final, post-downgrade/post-consolidation/post-injection set, so this
-// function needed no changes to satisfy "recommendation after dedup".
+// Operates on whatever `findings`/`evidence` it's given — the orchestrator
+// passes the final, post-downgrade/post-consolidation/post-injection set,
+// so this function needed no changes to satisfy "recommendation after
+// dedup". `evidence` defaults to `[]` for callers that only have findings
+// (e.g. legacy call sites); with no evidence, no foundational finding can
+// satisfy the evidence-backing gate above, which is the conservative,
+// never-falsely-ReelBuild default — see Task #2.18.
+//
+// Phase 2.5 calibration review: a 5-site validation batch (a luxury hotel,
+// two established restaurants/riads, a small café) all landed on ReelFix.
+// Reviewed and confirmed this is correct, not a threshold bug — none of
+// those sites had a `critical` finding in a FOUNDATIONAL_CATEGORIES
+// (positioning/service_clarity), only real, evidence-backed `important`
+// accessibility/technical defects, which is "repairable friction" by this
+// function's own definition. ReelBuild is intentionally reserved for sites
+// whose basic positioning or service clarity is critically broken —
+// making it rare is the point, not a bug. No thresholds were changed here;
+// see reelscan.test.ts's "Fix-before-Build recommendation" tests.
 export function recommendReelScanAction(
-  findings: FindingRecord[]
+  findings: FindingRecord[],
+  evidence: EvidenceRecord[] = []
 ): ReelScanRecommendation {
+  const evidenceById = new Map(evidence.map((item) => [item.id, item]));
   const issues = findings.filter((finding) => finding.kind === "issue");
   const criticalFoundational = issues.filter(
     (finding) =>
       finding.severity === "critical" &&
-      FOUNDATIONAL_CATEGORIES.has(finding.category as ReelScanCategory)
+      FOUNDATIONAL_CATEGORIES.has(finding.category as ReelScanCategory) &&
+      isFoundationallyEvidenceBacked(finding, evidenceById)
   );
   if (criticalFoundational.length)
     return {
@@ -1077,7 +1148,7 @@ async function runReelScanV1Core(
     analysisRun: auditLedger.getScanAuditTrail(scanId).analysisRuns.at(-1)!,
     findings,
     score: calculateReelScanScore(findings),
-    recommendation: recommendReelScanAction(findings),
+    recommendation: recommendReelScanAction(findings, evidence),
     reviewStatus: "needs_review"
   };
 }
@@ -1154,6 +1225,10 @@ export async function runReelScanV1Target(
   const capturedAt = new Date().toISOString();
   const signals = extractContentSignals(fetchResult.finalUrl, fetchResult.html);
   const genericFindings = genericHtmlChecks(fetchResult.finalUrl, fetchResult.html);
+  // Customer target, not Client #0: deliberately NOT passing
+  // includeServiceTermEvidence — whether this business's website mentions
+  // ReelHaus's own product names is not a website-quality signal and must
+  // never affect a customer's evidence, findings, score, or recommendation.
   const evidenceInputs = [
     ...contentEvidenceInputs(scanId, signals, capturedAt),
     ...technicalEvidenceFromGenericFindings(scanId, genericFindings, capturedAt)

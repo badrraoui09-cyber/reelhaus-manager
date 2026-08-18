@@ -4,7 +4,12 @@ import {
   validateCloudflareAccess,
   type AccessValidationResult
 } from "./access-auth";
-import { isApiPath, isKnownApiRoute, isPublicApiRoute } from "./server-routing";
+import {
+  isApiPath,
+  isKnownApiRoute,
+  isPublicApiRoute,
+  rejectsForContentType
+} from "./server-routing";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -73,6 +78,8 @@ async function routeAccessDiagnostic(
 async function routeApi(request: Request, env: WorkerEnv): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth.identity) return json(authenticationError(auth.access), 401);
+  if (rejectsForContentType(request))
+    return json({ error: "Content-Type must be application/json" }, 415);
   const incoming = new URL(request.url);
   const internalPath = incoming.pathname.replace(/^\/api/, "") || "/";
   const internalUrl = new URL(internalPath + incoming.search, incoming.origin);

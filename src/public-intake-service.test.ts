@@ -3,12 +3,20 @@ import type { WorkersAiBinding } from "./ai-service";
 import { AuditLedgerService, InMemoryAuditLedgerStore } from "./audit-ledger";
 import {
   PublicIntakeService,
+  buildInboundRequestReelFixProof,
+  buildInboundRequestReportPreview,
+  buildInboundRequestSalesDecisionView,
   listInboundRequestsForManager,
   normalizeScanTargetKey,
   type PublicIntakeDeps
 } from "./public-intake-service";
-import { InMemoryPublicIntakeStore } from "./public-intake-store";
+import { InMemoryPublicIntakeStore, type InboundRequestRecord } from "./public-intake-store";
 import type { PublicReelScanRequest } from "./public-request-schema";
+import { runReelScanV1Target } from "./reelscan";
+import {
+  InMemoryReelFixVerificationStore,
+  ReelFixVerificationService
+} from "./reelfix-verification";
 
 function fakeAi(run: WorkersAiBinding["run"]): WorkersAiBinding {
   return { run };
@@ -858,5 +866,363 @@ describe("listInboundRequestsForManager", () => {
     const views = listInboundRequestsForManager(store, auditLedger);
     expect(views[0].requestStatus).toBe("queued_for_scan");
     expect(views[0].score).toBeUndefined();
+  });
+});
+
+// Task #2.7: internal Manager-only report preview, reusing
+// buildReelScanCustomerReport() rather than a second formatter.
+describe("buildInboundRequestReportPreview", () => {
+  it("returns null when there is no completed scan yet (not scan_ready_needs_review)", async () => {
+    const { service, store, auditLedger } = buildService();
+    await service.submit(baseRequest(), "caller-1", null);
+    const record = store.listRequests(1)[0];
+    expect(record.requestStatus).not.toBe("scan_ready_needs_review");
+    expect(buildInboundRequestReportPreview(record, auditLedger)).toBeNull();
+  });
+
+  it("builds the customer report shape from a completed scan, using the request's own business name and link", async () => {
+    const { service, store, auditLedger } = buildService({ fetcher: websiteFetcher(SAFE_HTML) });
+    await service.submit(
+      baseRequest({ businessName: "Le Petit Café", link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const record = store.listRequests(1)[0];
+    expect(record.requestStatus).toBe("scan_ready_needs_review");
+
+    const report = buildInboundRequestReportPreview(record, auditLedger);
+    expect(report).not.toBeNull();
+    expect(report!.businessName).toBe("Le Petit Café");
+    expect(report!.websiteUrl).toBe("https://lepetitcafe.example/");
+    expect(typeof report!.scoreOutOf100).toBe("number");
+    expect(report!.recommendation).not.toBeNull();
+    expect(Array.isArray(report!.highlights)).toBe(true);
+    expect(Array.isArray(report!.opportunities)).toBe(true);
+  });
+
+  it("never leaks raw evidence, evidence IDs, or findings into the preview", async () => {
+    const { service, store, auditLedger } = buildService({ fetcher: websiteFetcher(SAFE_HTML) });
+    await service.submit(
+      baseRequest({ link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const record = store.listRequests(1)[0];
+
+    const report = buildInboundRequestReportPreview(record, auditLedger);
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain("evidenceIds");
+    expect(serialized).not.toContain("evidence");
+    expect(serialized).not.toContain("findings");
+    expect(serialized).not.toContain("confidence");
+    expect(serialized).not.toContain("severity");
+    expect(serialized).not.toContain("collector");
+
+    // The raw technical detail is still available separately, unchanged,
+    // via the audit ledger directly (what GET /api/audit/scans/:id uses).
+    const trail = auditLedger.getScanAuditTrail(record.scanId!);
+    expect(trail.evidence.length).toBeGreaterThan(0);
+  });
+});
+
+// Task #2.11: internal ReelHaus sales decision view. Reuses
+// buildReelScanCustomerReport() and analyzeCommercialContext() — these
+// tests are about the composition/gating/leak-safety, not re-testing
+// either module's own internal rules (already covered by their own test
+// files).
+describe("buildInboundRequestSalesDecisionView", () => {
+  it("returns null when there is no completed scan yet", async () => {
+    const { service, store, auditLedger } = buildService();
+    await service.submit(baseRequest(), "caller-1", null);
+    const record = store.listRequests(1)[0];
+    expect(buildInboundRequestSalesDecisionView(record, auditLedger)).toBeNull();
+  });
+
+  it("1. the commercial analysis correctly appears in the internal view", async () => {
+    const { service, store, auditLedger } = buildService({ fetcher: websiteFetcher(SAFE_HTML) });
+    await service.submit(
+      baseRequest({ businessName: "Green Black Café", link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const record = store.listRequests(1)[0];
+
+    const view = buildInboundRequestSalesDecisionView(record, auditLedger, {
+      category: "independent café"
+    });
+    expect(view).not.toBeNull();
+    expect(view!.business).toEqual({
+      businessName: "Green Black Café",
+      websiteUrl: "https://lepetitcafe.example/",
+      category: "independent café",
+      location: record.city || null
+    });
+    expect(view!.commercial.opportunityLevel).toBe("high");
+    expect(["ReelFix", "ReelBuild", "ReelCare", "No action"]).toContain(
+      view!.commercial.recommendedService
+    );
+    expect(typeof view!.commercial.explanation).toBe("string");
+    expect(view!.commercial.explanation.length).toBeGreaterThan(0);
+    expect(["high", "medium", "low"]).toContain(view!.commercial.confidence);
+  });
+
+  it("1b. Task #2.14: businessFit/improvementNeed/salesRecommendation appear, reusing the same analysis (not recomputed)", async () => {
+    const { service, store, auditLedger } = buildService({ fetcher: websiteFetcher(SAFE_HTML) });
+    await service.submit(
+      baseRequest({ businessName: "Green Black Café", link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const record = store.listRequests(1)[0];
+
+    const view = buildInboundRequestSalesDecisionView(record, auditLedger, {
+      category: "independent café"
+    });
+    // businessFit mirrors opportunityLevel exactly — same underlying value.
+    expect(view!.commercial.businessFit).toBe(view!.commercial.opportunityLevel);
+    expect(["high", "medium", "low"]).toContain(view!.commercial.improvementNeed);
+    expect(["Contact", "Research more", "No action"]).toContain(
+      view!.commercial.salesRecommendation
+    );
+  });
+
+  it("2. the technical score is preserved (matches the customer report's own score)", async () => {
+    const { service, store, auditLedger } = buildService({ fetcher: websiteFetcher(SAFE_HTML) });
+    await service.submit(
+      baseRequest({ link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const record = store.listRequests(1)[0];
+
+    const report = buildInboundRequestReportPreview(record, auditLedger);
+    const view = buildInboundRequestSalesDecisionView(record, auditLedger);
+    expect(view!.technical.technicalHealthScore).toBe(report!.scoreOutOf100);
+    expect(typeof view!.technical.technicalHealthScore).toBe("number");
+  });
+
+  it("3. no evidence IDs, AI/analysis-run metadata, or raw technical audit data leaks into the sales view", async () => {
+    const { service, store, auditLedger } = buildService({ fetcher: websiteFetcher(SAFE_HTML) });
+    await service.submit(
+      baseRequest({ link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const record = store.listRequests(1)[0];
+
+    const view = buildInboundRequestSalesDecisionView(record, auditLedger);
+    const serialized = JSON.stringify(view);
+    for (const forbidden of [
+      '"evidenceIds"',
+      '"analysisRunId"',
+      '"collector"',
+      '"scoreImpact"',
+      '"findings"',
+      '"evidence"',
+      '"sourceUrl"',
+      '"observationType"'
+    ])
+      expect(serialized).not.toContain(forbidden);
+
+    // Raw technical detail is still available separately, unchanged.
+    const trail = auditLedger.getScanAuditTrail(record.scanId!);
+    expect(trail.evidence.length).toBeGreaterThan(0);
+    expect(trail.findings.length).toBeGreaterThan(0);
+  });
+
+  it("4. the default review decision is always undecided — never auto-selected", async () => {
+    const { service, store, auditLedger } = buildService({ fetcher: websiteFetcher(SAFE_HTML) });
+    // Two very different profiles — a strong independent case and a weak
+    // one — to confirm the decision default never varies with the result.
+    await service.submit(
+      baseRequest({ businessName: "A", link: "https://lepetitcafe.example/" }),
+      "caller-1",
+      null
+    );
+    await service.processQueue(Date.now(), 20);
+    const record = store.listRequests(1)[0];
+
+    const view = buildInboundRequestSalesDecisionView(record, auditLedger, {
+      category: "luxury international hotel"
+    });
+    expect(view!.reviewDecision).toBe("undecided");
+    const view2 = buildInboundRequestSalesDecisionView(record, auditLedger, {
+      category: "independent restaurant"
+    });
+    expect(view2!.reviewDecision).toBe("undecided");
+  });
+});
+
+// Task #2.19 — ReelFix proof loop, end-to-end through the same
+// composition sales-agent.ts's /reelfix-proof route calls. Baseline and
+// verification scans are produced with two direct runReelScanV1Target()
+// calls (not via PublicIntakeService.submit()/processQueue(), which would
+// reuse the SAME scanId for a second submission of the same target inside
+// the reuse freshness window — exactly the outcome a genuine before/after
+// pair must NOT collapse into) and then attached to two hand-built
+// InboundRequestRecord rows, the same way a real baseline request and a
+// later, separate verification request would each carry their own
+// scanId.
+describe("buildInboundRequestReelFixProof", () => {
+  function targetFetcher(html: string): typeof fetch {
+    return (async () =>
+      new Response(html, {
+        status: 200,
+        headers: { "content-type": "text/html" }
+      })) as unknown as typeof fetch;
+  }
+
+  const BASELINE_HTML = `<!DOCTYPE html><html lang="fr"><head>
+    <title>Le Petit Café</title>
+    </head><body>
+    <h1>Le Petit Café</h1>
+    <form><input type="email"></form>
+  </body></html>`;
+
+  // The email input now has a label — the deterministic form-labeling
+  // defect genuinely no longer fires.
+  const VERIFICATION_HTML = `<!DOCTYPE html><html lang="fr"><head>
+    <title>Le Petit Café</title>
+    </head><body>
+    <h1>Le Petit Café</h1>
+    <form><label for="e">Email</label><input id="e" type="email"></form>
+  </body></html>`;
+
+  function inboundRequestFor(
+    scanId: string,
+    businessName: string,
+    submittedLink: string
+  ): InboundRequestRecord {
+    return {
+      id: `req-${scanId}`,
+      createdAt: "2026-08-19T09:00:00.000Z",
+      updatedAt: "2026-08-19T09:00:00.000Z",
+      name: "Amina",
+      businessName,
+      city: "Casablanca",
+      supportNeed: "reelscan",
+      submittedLink,
+      linkKind: "website",
+      language: "fr",
+      requestStatus: "scan_ready_needs_review",
+      scanId,
+      scanStatus: "completed",
+      scanCompletedAt: "2026-08-19T09:05:00.000Z",
+      privacyAcceptedAt: "2026-08-19T09:00:00.000Z"
+    };
+  }
+
+  async function buildBaselineAndVerification(auditLedger: AuditLedgerService) {
+    const ai = fakeAi(async () => ({ response: JSON.stringify({ findings: [] }) }));
+    const baseline = await runReelScanV1Target({
+      targetUrl: "https://lepetitcafe.example/",
+      ai,
+      auditLedger,
+      fetcher: targetFetcher(BASELINE_HTML)
+    });
+    const verification = await runReelScanV1Target({
+      targetUrl: "https://lepetitcafe.example/",
+      ai,
+      auditLedger,
+      fetcher: targetFetcher(VERIFICATION_HTML)
+    });
+    return { baseline, verification };
+  }
+
+  it("produces a customer-safe before/after report once the two scans are linked", async () => {
+    const auditLedger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const { baseline, verification } = await buildBaselineAndVerification(auditLedger);
+    const verificationService = new ReelFixVerificationService(
+      auditLedger,
+      new InMemoryReelFixVerificationStore()
+    );
+    verificationService.linkVerification({
+      baselineScanId: baseline.scanId,
+      verificationScanId: verification.scanId
+    });
+
+    const baselineRecord = inboundRequestFor(
+      baseline.scanId,
+      "Le Petit Café",
+      "https://lepetitcafe.example/"
+    );
+    const report = buildInboundRequestReelFixProof(
+      baselineRecord,
+      null,
+      auditLedger,
+      verificationService
+    );
+
+    expect(report).not.toBeNull();
+    expect(report!.businessName).toBe("Le Petit Café");
+    expect(report!.technicalHealth.before).not.toBeNull();
+    expect(report!.technicalHealth.after).not.toBeNull();
+    // The score never headlines the report.
+    expect(report!.whatChanged).not.toMatch(/\d+\/100/);
+  });
+
+  it("returns null (not a fabricated report) when no verification is linked yet", async () => {
+    const auditLedger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const { baseline } = await buildBaselineAndVerification(auditLedger);
+    const verificationService = new ReelFixVerificationService(
+      auditLedger,
+      new InMemoryReelFixVerificationStore()
+    );
+    const baselineRecord = inboundRequestFor(
+      baseline.scanId,
+      "Le Petit Café",
+      "https://lepetitcafe.example/"
+    );
+
+    expect(
+      buildInboundRequestReelFixProof(baselineRecord, null, auditLedger, verificationService)
+    ).toBeNull();
+  });
+
+  it("11 & 12 (integration). the full route-level composition leaks no internal sales or raw technical/AI metadata", async () => {
+    const auditLedger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const { baseline, verification } = await buildBaselineAndVerification(auditLedger);
+    const verificationService = new ReelFixVerificationService(
+      auditLedger,
+      new InMemoryReelFixVerificationStore()
+    );
+    verificationService.linkVerification({
+      baselineScanId: baseline.scanId,
+      verificationScanId: verification.scanId
+    });
+    const baselineRecord = inboundRequestFor(
+      baseline.scanId,
+      "Le Petit Café",
+      "https://lepetitcafe.example/"
+    );
+
+    const report = buildInboundRequestReelFixProof(
+      baselineRecord,
+      null,
+      auditLedger,
+      verificationService
+    )!;
+    const serialized = JSON.stringify(report);
+
+    for (const forbidden of [
+      "businessFit",
+      "businessSegment",
+      "improvementNeed",
+      "salesRecommendation",
+      "reviewDecision",
+      "evidenceIds",
+      "collector",
+      "analysisRunId",
+      "scoreImpact",
+      "confidence",
+      "rootFindingKey"
+    ])
+      expect(serialized).not.toContain(forbidden);
   });
 });

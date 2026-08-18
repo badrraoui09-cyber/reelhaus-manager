@@ -645,6 +645,45 @@ describe("Fix-before-Build recommendation", () => {
     };
   }
 
+  // Task #2.18 — a verified, deterministic-collector evidence record, the
+  // only kind that can back a critical foundational finding into ReelBuild.
+  function verifiedFoundationalEvidence(
+    overrides: Partial<EvidenceRecord> = {}
+  ): EvidenceRecord {
+    return {
+      id: "ev-1",
+      scanId: "scan-1",
+      sourceType: "html_static",
+      sourceUrl: "https://example.com/",
+      observationType: "metadata",
+      observation: "No page title or meta description found anywhere on the page.",
+      capturedAt: "2026-08-17T09:00:00.000Z",
+      collector: "reelscan-v1@generic-website-checks",
+      metadata: { severity: "critical", verification: "verified" },
+      ...overrides
+    };
+  }
+
+  // An AI content-quality judgment: cites only unverified/manual-review
+  // evidence (e.g. the model's own read of the hero text), never a
+  // deterministic collector — exactly the Riad Kniza-shaped input.
+  function unverifiedContentEvidence(
+    overrides: Partial<EvidenceRecord> = {}
+  ): EvidenceRecord {
+    return {
+      id: "ev-1",
+      scanId: "scan-1",
+      sourceType: "html_static",
+      sourceUrl: "https://example.com/",
+      observationType: "hero_text_excerpt",
+      observation: "Bienvenue chez nous.",
+      capturedAt: "2026-08-17T09:00:00.000Z",
+      collector: "reelscan-v1@ai-content-signals",
+      metadata: { verification: "inference" },
+      ...overrides
+    };
+  }
+
   it("recommends no change when there are no supported issues", () => {
     expect(recommendReelScanAction([]).action).toBe("no_immediate_change");
   });
@@ -657,11 +696,54 @@ describe("Fix-before-Build recommendation", () => {
     expect(recommendReelScanAction(findings).action).toBe("ReelFix");
   });
 
-  it("only recommends ReelBuild for a critical, foundational problem", () => {
+  // Phase 2.5 calibration review: the 5-site validation batch (a luxury
+  // hotel, two established restaurants/riads, and a small café) all
+  // received ReelFix. This documents why that is the correct outcome, not
+  // a calibration bug — none of those sites had a critical, foundational
+  // (positioning/service_clarity) defect; they had multiple real,
+  // evidence-backed `important` accessibility/technical issues, which is
+  // exactly "repairable friction" by definition. No threshold was changed.
+  it("recommends ReelFix, not ReelBuild, for many important accessibility/technical issues with no foundational defect", () => {
     const findings = [
-      finding({ category: "positioning", severity: "critical" })
+      finding({ id: "a", category: "consistency", severity: "important" }),
+      finding({ id: "b", category: "consistency", severity: "important" }),
+      finding({ id: "c", category: "technical", severity: "important" }),
+      finding({ id: "d", category: "technical", severity: "important" }),
+      finding({ id: "e", category: "trust", severity: "optional" })
     ];
-    expect(recommendReelScanAction(findings).action).toBe("ReelBuild");
+    expect(recommendReelScanAction(findings).action).toBe("ReelFix");
+  });
+
+  it("recommends ReelBuild for a critical, foundational problem backed by verified deterministic evidence", () => {
+    const findings = [
+      finding({ category: "positioning", severity: "critical", evidenceIds: ["ev-1"] })
+    ];
+    const evidence = [verifiedFoundationalEvidence()];
+    expect(recommendReelScanAction(findings, evidence).action).toBe("ReelBuild");
+  });
+
+  // Task #2.18 — the exact Riad Kniza shape: an AI-asserted "critical"
+  // positioning finding whose only cited evidence is unverified/content
+  // judgment, not a deterministic technical fact. This alone must not
+  // reach ReelBuild, however the AI happened to word its severity call.
+  it("does NOT recommend ReelBuild for a subjective AI content-quality judgment alone, even at critical severity", () => {
+    const findings = [
+      finding({ category: "positioning", severity: "critical", evidenceIds: ["ev-1"] })
+    ];
+    const evidence = [unverifiedContentEvidence()];
+    const result = recommendReelScanAction(findings, evidence);
+    expect(result.action).not.toBe("ReelBuild");
+    // The finding doesn't vanish — an otherwise-functional site with this
+    // kind of finding still gets a repair pitch, not silence.
+    expect(result.action).toBe("ReelFix");
+  });
+
+  it("does NOT recommend ReelBuild for a critical foundational finding with no evidence at all", () => {
+    const findings = [
+      finding({ category: "service_clarity", severity: "critical", evidenceIds: ["ev-1"] })
+    ];
+    expect(recommendReelScanAction(findings, []).action).not.toBe("ReelBuild");
+    expect(recommendReelScanAction(findings).action).not.toBe("ReelBuild");
   });
 
   it("does not recommend ReelBuild merely because the site is imperfect", () => {
@@ -680,7 +762,52 @@ describe("Fix-before-Build recommendation", () => {
     ];
     expect(recommendReelScanAction(findings).action).toBe("ReelCare");
   });
+
+  // Task #2.18 repeatability regression: the same underlying deterministic
+  // evidence, with the AI's wording/severity choice varying between runs
+  // for a non-foundational content point, must converge on the same tier.
+  // (A genuinely evidence-backed foundational defect is exercised above;
+  // this fixture models the unstable case the Riad Kniza pilot surfaced.)
+  it("converges on the same service tier across different plausible AI severity wording for the same underlying evidence", () => {
+    const sharedEvidence = [unverifiedContentEvidence()];
+    const runA = [
+      finding({
+        id: "run-a",
+        category: "positioning",
+        severity: "critical",
+        evidenceIds: ["ev-1"],
+        summary: "The homepage does not clearly say what is offered."
+      })
+    ];
+    const runB = [
+      finding({
+        id: "run-b",
+        category: "positioning",
+        severity: "important",
+        evidenceIds: ["ev-1"],
+        summary: "The homepage's description of the offer could be clearer."
+      })
+    ];
+    const runC = [
+      finding({
+        id: "run-c",
+        category: "service_clarity",
+        severity: "critical",
+        evidenceIds: ["ev-1"],
+        summary: "It's unclear what the business actually offers."
+      })
+    ];
+    const actions = [runA, runB, runC].map(
+      (findings) => recommendReelScanAction(findings, sharedEvidence).action
+    );
+    expect(new Set(actions).size).toBe(1);
+    expect(actions[0]).toBe("ReelFix");
+  });
 });
+
+// customerFacingSummary()'s tests moved to reelscan-customer-report.test.ts
+// alongside the rest of Phase 2.6's report formatter — the function itself
+// moved out of reelscan.ts into src/reelscan-customer-report.ts.
 
 // -- Task #3D calibration fixes ---------------------------------------------
 
@@ -1487,6 +1614,35 @@ describe("runReelScanV1Target", () => {
     <p>Bienvenue chez nous. Réservez une table ou contactez-nous pour un événement privé.</p>
     <a href="mailto:contact@lepetitcafe.example">Contact</a>
   </body></html>`;
+
+  // Phase 2.5 fix #1: ReelHaus's own service-term self-check must never
+  // run against a customer target, even when the page happens to contain
+  // the exact words (e.g. a testimonial quoting "ReelFix" by coincidence).
+  it("never records service_term evidence for a customer target, unlike Client #0", async () => {
+    const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());
+    const htmlMentioningReelHausTerms = `<!DOCTYPE html><html lang="fr"><head>
+      <title>Le Petit Café</title>
+      </head><body>
+      <h1>Le Petit Café</h1>
+      <p>Un client a écrit: "leur ReelScan et leur ReelFix étaient rapides".</p>
+    </body></html>`;
+    const ai = fakeAi(async () => ({ response: JSON.stringify({ findings: [] }) }));
+
+    const result = await runReelScanV1Target({
+      targetUrl: "https://lepetitcafe.example/",
+      ai,
+      auditLedger: ledger,
+      fetcher: targetFetcher(htmlMentioningReelHausTerms)
+    });
+
+    expect(
+      result.evidence.some((item) => item.observationType.startsWith("service_term:"))
+    ).toBe(false);
+    // Confirms the omission actually mattered: the same words, run through
+    // Client #0's collector, DO produce service_term evidence (see the
+    // "evidence collection" describe block above) — this isn't a check
+    // that's simply broken everywhere.
+  });
 
   it("scans a safe generic target end to end and reaches needs_review", async () => {
     const ledger = new AuditLedgerService(new InMemoryAuditLedgerStore());

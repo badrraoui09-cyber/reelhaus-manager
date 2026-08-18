@@ -39,6 +39,24 @@ import {
   runReelScanV1Target,
   type ReelScanRecommendedAction
 } from "./reelscan";
+import {
+  buildReelScanCustomerReport,
+  type ReelScanCustomerReport
+} from "./reelscan-customer-report";
+import {
+  analyzeCommercialContext,
+  type CommercialConfidence,
+  type CommercialRecommendedService,
+  type ImprovementNeedLevel,
+  type ReelHausOpportunityLevel,
+  type SalesRecommendation
+} from "./reelscan-commercial-analysis";
+import { compareReelFixOutcome } from "./reelfix-comparison";
+import {
+  buildReelFixProofReport,
+  type ReelFixProofReport
+} from "./reelfix-proof-report";
+import type { ReelFixVerificationService } from "./reelfix-verification";
 
 /**
  * Hostname-level normalization for the target cooldown, so
@@ -393,8 +411,231 @@ export function summarizeInboundRequestForManager(
   return {
     ...record,
     score: calculateReelScanScore(trail.findings).score,
-    recommendation: recommendReelScanAction(trail.findings).action
+    recommendation: recommendReelScanAction(trail.findings, trail.evidence).action
   };
+}
+
+/**
+ * Task #2.7 — internal-only ReelScan report preview for an Access-
+ * protected Manager reviewer. Reuses buildReelScanCustomerReport()
+ * (src/reelscan-customer-report.ts) — the same formatter, not a second
+ * implementation — and the same score/recommendation derivation
+ * summarizeInboundRequestForManager() already uses above. Returns null
+ * (never an empty/fake report) when there is no completed scan to show
+ * yet, same gate as summarizeInboundRequestForManager. Raw evidence and
+ * findings are NOT part of this shape by construction (see
+ * ReelScanCustomerReport); a reviewer who wants the technical detail
+ * still has GET /api/audit/scans/:scanId, unchanged by this task. This
+ * function has no route of its own here — sales-agent.ts wires it to an
+ * Access-protected route, never the public one.
+ */
+export function buildInboundRequestReportPreview(
+  record: InboundRequestRecord,
+  auditLedger: AuditLedgerService
+): ReelScanCustomerReport | null {
+  if (!record.scanId || record.requestStatus !== "scan_ready_needs_review")
+    return null;
+  const trail = auditLedger.getScanAuditTrail(record.scanId);
+  return buildReelScanCustomerReport({
+    businessName: record.businessName,
+    targetUrl: record.submittedLink || "",
+    score: calculateReelScanScore(trail.findings),
+    recommendation: recommendReelScanAction(trail.findings, trail.evidence),
+    findings: trail.findings
+  });
+}
+
+// Task #2.11 — internal-only decision states. No automatic selection
+// anywhere in this file or reelscan-commercial-analysis.ts: every view
+// starts "undecided" and stays that way until a human reviewer actually
+// changes it (persisting that change is a future task — no storage for it
+// exists yet, so this always returns the default; see the file-level
+// comment on buildInboundRequestSalesDecisionView below).
+export const REVIEW_DECISIONS = [
+  "undecided",
+  "good_fit",
+  "research_more",
+  "not_fit"
+] as const;
+export type ReviewDecision = (typeof REVIEW_DECISIONS)[number];
+
+export interface ReelScanSalesDecisionView {
+  business: {
+    businessName: string;
+    websiteUrl: string;
+    /** Caller-supplied context — public intake does not collect a business category; null when not provided. */
+    category: string | null;
+    /** From the inbound request's own city field; null when not provided. */
+    location: string | null;
+  };
+  technical: {
+    technicalHealthScore: number | null;
+  };
+  commercial: {
+    opportunityLevel: ReelHausOpportunityLevel;
+    recommendedService: CommercialRecommendedService;
+    explanation: string;
+    confidence: CommercialConfidence;
+    confidenceReason: string;
+    /**
+     * Task #2.14 — the Task #2.13 sales decision layer, exposed here
+     * verbatim (not recomputed): businessFit is the same value as
+     * opportunityLevel above under the reviewer-facing vocabulary,
+     * improvementNeed drives the calibrated recommendedService, and
+     * salesRecommendation is the higher-level Contact/Research more/No
+     * action call. See src/reelscan-commercial-analysis.ts.
+     */
+    businessFit: ReelHausOpportunityLevel;
+    improvementNeed: ImprovementNeedLevel;
+    salesRecommendation: SalesRecommendation;
+  };
+  reviewDecision: ReviewDecision;
+}
+
+/**
+ * Task #2.11 — internal ReelHaus sales decision view for one inbound
+ * request: "is this a realistic opportunity, what service fits, why, and
+ * what's the reviewer's call so far." Reuses buildReelScanCustomerReport()
+ * (src/reelscan-customer-report.ts) for the business/technical fields and
+ * analyzeCommercialContext() (src/reelscan-commercial-analysis.ts) for the
+ * commercial fields — no formatting or commercial logic re-implemented
+ * here. Same completed-scan gate as buildInboundRequestReportPreview
+ * (returns null otherwise). By construction, only ever includes kind/
+ * title/summary/category-derived strings and the numeric score — no
+ * evidenceIds, confidence-on-a-finding, AI/analysis-run metadata, or raw
+ * audit data reaches this shape; the raw technical trail stays available,
+ * unchanged, via GET /api/audit/scans/:scanId.
+ *
+ * `reviewDecision` always starts "undecided" — there is no storage for a
+ * reviewer's actual choice yet (no schema change was made for this task);
+ * wiring persistence is a separate, future, explicitly-scoped task, not
+ * automatic selection.
+ */
+export function buildInboundRequestSalesDecisionView(
+  record: InboundRequestRecord,
+  auditLedger: AuditLedgerService,
+  businessContext: { category?: string } = {}
+): ReelScanSalesDecisionView | null {
+  if (!record.scanId || record.requestStatus !== "scan_ready_needs_review")
+    return null;
+  const trail = auditLedger.getScanAuditTrail(record.scanId);
+  const score = calculateReelScanScore(trail.findings);
+  const recommendation = recommendReelScanAction(trail.findings, trail.evidence);
+  const report = buildReelScanCustomerReport({
+    businessName: record.businessName,
+    targetUrl: record.submittedLink || "",
+    score,
+    recommendation,
+    findings: trail.findings
+  });
+  const commercial = analyzeCommercialContext({
+    businessName: record.businessName,
+    category: businessContext.category,
+    location: record.city,
+    score,
+    recommendation,
+    findings: trail.findings,
+    websiteEvidence: trail.evidence
+  });
+  return {
+    business: {
+      businessName: report.businessName,
+      websiteUrl: report.websiteUrl,
+      category: businessContext.category || null,
+      location: record.city || null
+    },
+    technical: { technicalHealthScore: report.scoreOutOf100 },
+    commercial: {
+      opportunityLevel: commercial.opportunityLevel,
+      recommendedService: commercial.recommendedService,
+      explanation: commercial.explanation,
+      confidence: commercial.confidence,
+      confidenceReason: commercial.confidenceReason,
+      businessFit: commercial.salesDecision.businessFit,
+      improvementNeed: commercial.salesDecision.improvementNeed,
+      salesRecommendation: commercial.salesDecision.salesRecommendation
+    },
+    reviewDecision: "undecided"
+  };
+}
+
+/**
+ * Task #2.19 — assembles the before/after ReelFix proof report for a
+ * baseline inbound request and either a caller-named verification request
+ * or (when omitted) the most recently linked one. Returns null when there
+ * is no completed baseline scan, or no verification link exists yet from
+ * that baseline scanId to the given/latest verification scanId — the
+ * caller (sales-agent.ts) maps that to a 409, same "null means not ready
+ * yet" convention as buildInboundRequestReportPreview() and
+ * buildInboundRequestSalesDecisionView() above. Reuses
+ * buildReelScanCustomerReport(), compareReelFixOutcome(), and
+ * buildReelFixProofReport() — no formatting, matching, or commercial
+ * logic re-implemented here. Never reads or exposes anything from
+ * reelscan-commercial-analysis.ts (Business Fit, Business Segment,
+ * improvementNeed, salesRecommendation) or reviewDecision — this is a
+ * customer-facing artifact, not the internal sales-decision view above.
+ */
+export function buildInboundRequestReelFixProof(
+  baselineRecord: InboundRequestRecord,
+  verificationRecord: InboundRequestRecord | null,
+  auditLedger: AuditLedgerService,
+  verificationService: ReelFixVerificationService
+): ReelFixProofReport | null {
+  if (!baselineRecord.scanId) return null;
+
+  const link = verificationRecord?.scanId
+    ? verificationService
+        .listVerifications(baselineRecord.scanId)
+        .find(
+          (candidate) => candidate.verificationScanId === verificationRecord.scanId
+        ) || null
+    : verificationService.latestVerification(baselineRecord.scanId);
+  if (!link) return null;
+
+  const baselineTrail = auditLedger.getScanAuditTrail(link.baselineScanId);
+  const verificationTrail = auditLedger.getScanAuditTrail(link.verificationScanId);
+  const baselineScore = calculateReelScanScore(baselineTrail.findings);
+  const verificationScore = calculateReelScanScore(verificationTrail.findings);
+
+  return buildReelFixProofReport({
+    businessName: baselineRecord.businessName,
+    websiteUrl: baselineRecord.submittedLink || "",
+    verificationDate: link.createdAt,
+    baselineReport: buildReelScanCustomerReport({
+      businessName: baselineRecord.businessName,
+      targetUrl: baselineRecord.submittedLink || "",
+      score: baselineScore,
+      recommendation: recommendReelScanAction(
+        baselineTrail.findings,
+        baselineTrail.evidence
+      ),
+      findings: baselineTrail.findings
+    }),
+    verificationReport: buildReelScanCustomerReport({
+      businessName: baselineRecord.businessName,
+      targetUrl: baselineRecord.submittedLink || "",
+      score: verificationScore,
+      recommendation: recommendReelScanAction(
+        verificationTrail.findings,
+        verificationTrail.evidence
+      ),
+      findings: verificationTrail.findings
+    }),
+    comparison: compareReelFixOutcome({
+      baseline: {
+        scanId: link.baselineScanId,
+        score: baselineScore,
+        findings: baselineTrail.findings,
+        evidence: baselineTrail.evidence
+      },
+      verification: {
+        scanId: link.verificationScanId,
+        score: verificationScore,
+        findings: verificationTrail.findings,
+        evidence: verificationTrail.evidence
+      }
+    })
+  });
 }
 
 export function listInboundRequestsForManager(

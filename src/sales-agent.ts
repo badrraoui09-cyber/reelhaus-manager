@@ -2,6 +2,7 @@ import { Agent } from "agents";
 import { checkAiHealth } from "./ai-service";
 import { AuditLedgerService, SqlAuditLedgerStore } from "./audit-ledger";
 import { analyzePublicBusinessWebsite } from "./browser-analysis";
+import { csvCell } from "./csv-cell";
 import {
   AGENT_HUNG_SCHEDULE_TIMEOUT_SECONDS,
   PUBLIC_INTAKE_RETENTION_DAYS,
@@ -16,9 +17,21 @@ import {
   SqlRetentionStatusStore,
   ensureRetentionCleanupSchedule
 } from "./public-intake-retention";
-import { PublicIntakeService, listInboundRequestsForManager } from "./public-intake-service";
+import {
+  PublicIntakeService,
+  buildInboundRequestReelFixProof,
+  buildInboundRequestReportPreview,
+  buildInboundRequestSalesDecisionView,
+  listInboundRequestsForManager
+} from "./public-intake-service";
 import { SqlPublicIntakeStore } from "./public-intake-store";
 import { runReelScanV1ClientZero } from "./reelscan";
+import { renderReelFixProofReportHtml } from "./reelfix-proof-report";
+import {
+  ReelFixVerificationError,
+  ReelFixVerificationService,
+  SqlReelFixVerificationStore
+} from "./reelfix-verification";
 import {
   BusinessAssistantAgent,
   EmailReviewAgent,
@@ -116,10 +129,6 @@ function boundedInt(value: string | undefined, fallback: number, max: number) {
     : fallback;
 }
 
-function csvCell(value: unknown): string {
-  const text = String(value ?? "");
-  return `"${text.replaceAll('"', '""')}"`;
-}
 
 function isPublicUrl(value: string): boolean {
   try {
@@ -175,6 +184,7 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
   private readonly auditLedger: AuditLedgerService;
   private readonly publicIntakeStore: SqlPublicIntakeStore;
   private readonly retentionStatusStore: SqlRetentionStatusStore;
+  private readonly reelFixVerification: ReelFixVerificationService;
 
   constructor(ctx: DurableObjectState, env: SalesEnv) {
     super(ctx, env);
@@ -183,6 +193,10 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
     );
     this.publicIntakeStore = new SqlPublicIntakeStore(this.ctx.storage.sql);
     this.retentionStatusStore = new SqlRetentionStatusStore(this.ctx.storage.sql);
+    this.reelFixVerification = new ReelFixVerificationService(
+      this.auditLedger,
+      new SqlReelFixVerificationStore(this.ctx.storage.sql)
+    );
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS reports (
         id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
@@ -418,6 +432,173 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
         return json(
           listInboundRequestsForManager(this.publicIntakeStore, this.auditLedger)
         );
+      // Task #2.7: internal-only, Access-protected report preview for one
+      // inbound request — reuses buildReelScanCustomerReport() via
+      // buildInboundRequestReportPreview(), never a second formatter. No
+      // outreach, no email, no PDF, no public route — this handler is
+      // only ever reached through routeApi()'s Cloudflare Access gate,
+      // the same as every other /inbound-requests* route.
+      if (
+        request.method === "GET" &&
+        /^\/inbound-requests\/[^/]+\/report$/.test(url.pathname)
+      ) {
+        const record = this.publicIntakeStore.getRequest(
+          url.pathname.split("/")[2]
+        );
+        if (!record) return json({ error: "Inbound request not found" }, 404);
+        const report = buildInboundRequestReportPreview(record, this.auditLedger);
+        if (!report)
+          return json(
+            { error: "No completed scan is available for this request yet" },
+            409
+          );
+        return json(report);
+      }
+      // Task #2.11: internal ReelHaus sales decision view — a *separate*
+      // shape from /report above (never merged into it): the customer
+      // report stays free of anything internal-only, this route carries
+      // the reviewDecision field and is never meant to be shown to the
+      // scanned business. Reuses buildInboundRequestSalesDecisionView()
+      // (public-intake-service.ts), which itself reuses
+      // buildReelScanCustomerReport() and analyzeCommercialContext() —
+      // no formatting/commercial logic duplicated here either. Same
+      // Access-protected dispatch as every other /inbound-requests*
+      // route; ?category= is an optional, non-persisted reviewer hint
+      // (public intake collects no business category).
+      if (
+        request.method === "GET" &&
+        /^\/inbound-requests\/[^/]+\/sales-decision$/.test(url.pathname)
+      ) {
+        const record = this.publicIntakeStore.getRequest(
+          url.pathname.split("/")[2]
+        );
+        if (!record) return json({ error: "Inbound request not found" }, 404);
+        const view = buildInboundRequestSalesDecisionView(record, this.auditLedger, {
+          category: url.searchParams.get("category") || undefined
+        });
+        if (!view)
+          return json(
+            { error: "No completed scan is available for this request yet" },
+            409
+          );
+        return json(view);
+      }
+      // Task #2.19 Part A/D — internal-only creation of a ReelFix
+      // verification link between two completed scans, keyed by their
+      // underlying scanIds via ReelFixVerificationService (works for any
+      // completed scan, not only ones that went through public intake).
+      // Access-protected like every other /inbound-requests* route;
+      // never added to PUBLIC_API_ROUTES. Creating a link only makes a
+      // comparison possible — it never delivers anything to a customer;
+      // see /reelfix-proof below for the actual proof report, itself
+      // still gated behind the same Access protection.
+      if (
+        request.method === "POST" &&
+        /^\/inbound-requests\/[^/]+\/reelfix-verification$/.test(url.pathname)
+      ) {
+        const baselineRecord = this.publicIntakeStore.getRequest(
+          url.pathname.split("/")[2]
+        );
+        if (!baselineRecord)
+          return json({ error: "Inbound request not found" }, 404);
+        if (!baselineRecord.scanId)
+          return json(
+            { error: "No completed scan is available for this request yet" },
+            409
+          );
+        let body: unknown;
+        try {
+          body = parseJson<unknown>(await request.text());
+        } catch {
+          return json({ error: "Invalid JSON body" }, 400);
+        }
+        // Task #2.21 security audit (Section 1, input validation):
+        // parseJson<T>() is a type-only cast — it does not check at
+        // runtime that verificationRequestId is actually a string. A
+        // non-string value (a number, object, or array) here previously
+        // reached PublicIntakeStore.getRequest(id: string) unchecked;
+        // parameterized SQL made that safe from injection, but it is
+        // still malformed input that should be rejected explicitly
+        // rather than relied on to fail cleanly by accident.
+        const verificationRequestId =
+          body &&
+          typeof body === "object" &&
+          typeof (body as { verificationRequestId?: unknown }).verificationRequestId ===
+            "string"
+            ? (body as { verificationRequestId: string }).verificationRequestId
+            : undefined;
+        const verificationRecord = verificationRequestId
+          ? this.publicIntakeStore.getRequest(verificationRequestId)
+          : null;
+        if (!verificationRecord)
+          return json({ error: "verificationRequestId not found" }, 404);
+        if (!verificationRecord.scanId)
+          return json(
+            {
+              error:
+                "No completed scan is available for the verification request yet"
+            },
+            409
+          );
+        try {
+          const link = this.reelFixVerification.linkVerification({
+            baselineScanId: baselineRecord.scanId,
+            verificationScanId: verificationRecord.scanId
+          });
+          return json(link, 201);
+        } catch (error) {
+          const reason =
+            error instanceof ReelFixVerificationError
+              ? error.reason
+              : "link_failed";
+          return json({ error: reason }, 409);
+        }
+      }
+      // Task #2.19 Part C/D — the printable, customer-safe ReelFix
+      // before/after proof report for the latest verification linked to
+      // this baseline (or ?verificationRequestId= to name a different
+      // one explicitly). Returns HTML directly so an Access-
+      // authenticated operator can open it in a browser and print/save
+      // it as a PDF themselves — no PDF-generation dependency, no auto-
+      // email, no auto-delivery. This route, reachable only through the
+      // same Cloudflare Access gate as every other Manager route, IS the
+      // human-review gate: nothing here ever becomes customer-visible
+      // without a human actively requesting it and then manually
+      // delivering it outside this system.
+      if (
+        request.method === "GET" &&
+        /^\/inbound-requests\/[^/]+\/reelfix-proof$/.test(url.pathname)
+      ) {
+        const baselineRecord = this.publicIntakeStore.getRequest(
+          url.pathname.split("/")[2]
+        );
+        if (!baselineRecord)
+          return new Response("Inbound request not found", { status: 404 });
+        const verificationRequestId = url.searchParams.get(
+          "verificationRequestId"
+        );
+        const verificationRecord = verificationRequestId
+          ? this.publicIntakeStore.getRequest(verificationRequestId)
+          : null;
+        const report = buildInboundRequestReelFixProof(
+          baselineRecord,
+          verificationRecord,
+          this.auditLedger,
+          this.reelFixVerification
+        );
+        if (!report)
+          return new Response(
+            "No verified ReelFix proof is available for this request yet",
+            { status: 409 }
+          );
+        return new Response(renderReelFixProofReportHtml(report), {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store"
+          }
+        });
+      }
       if (request.method === "GET" && url.pathname === "/inbound-retention/status")
         return await this.inboundRetentionStatus();
       if (
@@ -537,12 +718,19 @@ export class ReelHausManager extends Agent<SalesEnv, Record<string, never>> {
       // This branch exists only in case that layer is ever bypassed —
       // e.g. a bug introduced above this line, before dispatch even reaches
       // it — so the public path can never fall through to this catch's
-      // normal { error: message(error) } shape, which is private-diagnostic
-      // by design and would leak internal detail if it reached a public
-      // caller.
+      // shape below.
       if (url.pathname === "/public-intake/submit")
         return json({ ok: false, error: "try_again_later" }, 503);
-      return json({ error: message(error) }, 500);
+      // Task #2.21 security audit (Section 7/9, information leakage):
+      // this used to return { error: message(error) } — the raw
+      // exception message — to the caller. Every route here is still
+      // Access-protected, so the audience was never a public/anonymous
+      // caller, but a raw error string can still carry more than intended
+      // (an internal identifier, a lower-layer library's own wording) and
+      // there is no reason for the client-facing response to say more
+      // than "internal_error" once the real detail is already captured
+      // server-side in the console.error() call above.
+      return json({ error: "internal_error" }, 500);
     }
   }
 

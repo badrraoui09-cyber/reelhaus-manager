@@ -1,10 +1,12 @@
 import puppeteer from "@cloudflare/puppeteer";
+import { safeFetchPublicUrl } from "./safe-fetch";
 import type {
   EvidenceConfidence,
   GuestJourneyStage,
   ObservedIssue,
   PublicWebsiteObservation
 } from "./sales-types";
+import { validatePublicScanUrl } from "./url-safety";
 
 const MAX_PAGE_BYTES = 2_000_000;
 
@@ -296,30 +298,30 @@ function gastronomyObservations(
   return observations;
 }
 
+// Task #2.21 security audit: this used to be a raw fetch(url, {redirect:
+// "follow"}) — every redirect hop was followed WITHOUT re-checking it
+// against url-safety.ts's private-IP/localhost/metadata-hostname rules,
+// unlike the public ReelScan intake path (safe-fetch.ts), which was built
+// specifically to close that gap. safeFetchPublicUrl() re-validates every
+// hop, so this fallback path now gets the same protection the public path
+// already had. The caller (analyzePublicBusinessWebsite) validates the
+// ORIGINAL url before this function is ever reached — see its own comment
+// for the residual limitation that remains (mid-navigation browser
+// redirects, and DNS rebinding, cannot be intercepted the same way).
 async function analyzePublicHtml(
   url: URL
 ): Promise<PublicWebsiteObservation> {
-  const response = await fetch(url, {
-    headers: {
-      accept: "text/html,application/xhtml+xml",
-      "user-agent": "ReelHaus-Manager/1.0 public-business-audit"
-    },
-    redirect: "follow",
-    signal: AbortSignal.timeout(12_000)
+  const fetched = await safeFetchPublicUrl(fetch, url.toString(), {
+    totalTimeoutMs: 12_000,
+    maxContentBytes: MAX_PAGE_BYTES,
+    userAgent: "ReelHaus-Manager/1.0 public-business-audit"
   });
-  if (!response.ok) throw new Error(`Website returned HTTP ${response.status}`);
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.toLowerCase().includes("text/html"))
-    throw new Error("Website did not return HTML");
-  const declaredLength = Number(response.headers.get("content-length") || 0);
-  if (declaredLength > MAX_PAGE_BYTES)
-    throw new Error("Website HTML exceeds the analysis size limit");
-  const html = await response.text();
-  if (new TextEncoder().encode(html).byteLength > MAX_PAGE_BYTES)
-    throw new Error("Website HTML exceeds the analysis size limit");
+  if (!fetched.ok)
+    throw new Error(`Website fetch failed safety/availability check: ${fetched.reason}`);
+  const html = fetched.html;
 
   const observedAt = new Date().toISOString();
-  const finalUrl = new URL(response.url || url.toString());
+  const finalUrl = new URL(fetched.finalUrl);
   const htmlTag = html.match(/<html\b[^>]*>/i)?.[0] || "";
   const title = textContent(html.match(/<title\b[^>]*>[\s\S]*?<\/title>/i)?.[0] || "");
   const bodyText = textContent(html);
@@ -437,29 +439,48 @@ function robotsAllows(robots: string, pathname: string): boolean {
   return true;
 }
 
+// Task #2.21 security audit finding: this function used to accept any
+// http(s) URL with no further check — no private-IP/localhost/cloud-
+// metadata-hostname rejection, no credentials-in-URL rejection — even
+// though it is reachable, via auditLead() -> POST /api/leads/:id/audit
+// (Access-protected, but still a real internal workflow that runs this
+// against externally-sourced business URLs), from data this app did not
+// itself generate. url-safety.ts already has exactly this rule set, built
+// for the public ReelScan intake; reusing it here closes the gap without
+// inventing a second policy. Rejects plain http:// too, matching that
+// same policy (https-only) rather than the looser check this function had
+// before.
 export async function analyzePublicBusinessWebsite(
   browserBinding: BrowserRun | Fetcher,
   websiteUrl: string
 ): Promise<PublicWebsiteObservation> {
-  const url = new URL(websiteUrl);
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error("Only public HTTP(S) websites can be analyzed");
-  }
+  const validated = validatePublicScanUrl(websiteUrl);
+  if (!validated.ok)
+    throw new Error(`Website URL failed safety validation: ${validated.reason}`);
+  const url = new URL(validated.url);
+
   const robotsUrl = new URL("/robots.txt", url);
-  const robotsResponse = await fetch(robotsUrl, {
-    headers: { "user-agent": "ReelHaus-Manager/1.0" },
-    signal: AbortSignal.timeout(8_000)
+  const robotsFetched = await safeFetchPublicUrl(fetch, robotsUrl.toString(), {
+    totalTimeoutMs: 8_000,
+    maxContentBytes: MAX_PAGE_BYTES,
+    allowedContentTypes: ["text/plain", "text/html", "application/xhtml+xml"],
+    userAgent: "ReelHaus-Manager/1.0"
   });
-  if (robotsResponse.ok) {
-    const length = Number(robotsResponse.headers.get("content-length") || 0);
-    if (length <= MAX_PAGE_BYTES) {
-      const robots = await robotsResponse.text();
-      if (!robotsAllows(robots, url.pathname)) {
-        throw new Error("robots.txt disallows this page");
-      }
-    }
+  // A failed/missing/disallowed-content-type robots.txt fetch is treated
+  // exactly like a missing robots.txt always was — fail open on the
+  // courtesy check, never on the safety check above.
+  if (robotsFetched.ok && !robotsAllows(robotsFetched.html, url.pathname)) {
+    throw new Error("robots.txt disallows this page");
   }
 
+  // Residual, honestly-accepted limitation (same class as url-safety.ts's
+  // documented DNS-rebinding gap): `url` was validated above, but once a
+  // real browser session navigates it, a mid-navigation redirect inside
+  // that session is not re-checked against url-safety.ts the way
+  // safeFetchPublicUrl()'s own redirect hops are — Cloudflare's managed
+  // Browser Rendering API gives no request-interception hook this app
+  // uses today. Not solved here; not claimed to be solved.
+  //
   // Wrangler's BrowserRun and Puppeteer's Fetcher declarations describe the
   // same runtime binding but currently expose different helper methods.
   let browser;

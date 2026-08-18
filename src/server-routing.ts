@@ -47,6 +47,24 @@ const API_ROUTES: ReadonlyArray<{
   { method: "POST", pathname: /^\/api\/drafts\/[^/]+\/send$/ },
   { method: "POST", pathname: /^\/api\/assistant$/ },
   { method: "GET", pathname: /^\/api\/inbound-requests$/ },
+  // Task #2.7: internal-only report preview — Access-protected like every
+  // other route in this table (never added to PUBLIC_API_ROUTES below).
+  { method: "GET", pathname: /^\/api\/inbound-requests\/[^/]+\/report$/ },
+  // Task #2.11: internal-only sales decision view — same protection, a
+  // separate route/shape from the customer report above on purpose.
+  { method: "GET", pathname: /^\/api\/inbound-requests\/[^/]+\/sales-decision$/ },
+  // Task #2.19: internal-only ReelFix verification-link creation and the
+  // printable before/after proof report — same Access-protected dispatch
+  // as every other /inbound-requests* route, never added to
+  // PUBLIC_API_ROUTES below.
+  {
+    method: "POST",
+    pathname: /^\/api\/inbound-requests\/[^/]+\/reelfix-verification$/
+  },
+  {
+    method: "GET",
+    pathname: /^\/api\/inbound-requests\/[^/]+\/reelfix-proof$/
+  },
   { method: "GET", pathname: /^\/api\/inbound-retention\/status$/ }
 ];
 
@@ -74,5 +92,47 @@ export function isKnownApiRoute(method: string, pathname: string): boolean {
 export function isPublicApiRoute(method: string, pathname: string): boolean {
   return PUBLIC_API_ROUTES.some(
     (route) => route.method === method && route.pathname === pathname
+  );
+}
+
+// Task #2.21 security audit (Section 8, CSRF/HTTP behavior): Access-
+// protected routes carried no CSRF-specific defense of their own — no
+// anti-CSRF token, no Origin check, no Content-Type enforcement, unlike
+// the public intake route (body-limit.ts), which already requires exactly
+// "application/json". A classic technique (an attacker's cross-site
+// <form enctype="text/plain"> POST, crafted so its body still parses as
+// JSON) relies on the target accepting a non-JSON content type; every
+// state-changing private route already expects and parses a JSON body
+// (or none), so requiring the real content type here costs nothing for
+// any legitimate caller — the Manager dashboard's own fetch wrapper
+// already always sends it when it sends a body (see app.tsx) — while
+// closing that path off. This does not replace Cloudflare Access itself
+// as the actual authentication boundary; it is one additional, cheap,
+// isolated check. Lives here (not server.ts) so it can be unit tested —
+// server.ts re-exports ReelHausManager from sales-agent.ts, which pulls
+// in a `cloudflare:`-scheme module the plain Node/vitest ESM loader
+// cannot resolve, the same reason isKnownApiRoute()/isPublicApiRoute()
+// above already live in this file rather than in server.ts.
+export const STATE_CHANGING_METHODS = new Set([
+  "POST",
+  "PATCH",
+  "PUT",
+  "DELETE"
+]);
+
+export function hasValidJsonContentType(request: Request): boolean {
+  const contentType = (request.headers.get("content-type") || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  return contentType === "application/json";
+}
+
+/** True when a state-changing request with a body must be rejected for lacking a valid JSON Content-Type. */
+export function rejectsForContentType(request: Request): boolean {
+  return (
+    STATE_CHANGING_METHODS.has(request.method) &&
+    Boolean(request.body) &&
+    !hasValidJsonContentType(request)
   );
 }
